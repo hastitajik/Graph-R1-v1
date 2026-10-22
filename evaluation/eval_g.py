@@ -4,8 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 
 # 设置 OpenAI API 密钥
-os.environ["OPENAI_API_KEY"] = open("openai_api_key.txt").read().strip()
-client = OpenAI()
+client = OpenAI(base_url="http://192.168.4.114:5577/v1", api_key="dummy")
+JUDGE_MODEL = "Qwen3.8-27B"
 
 def cal_gen(question, answers, generation):
     exp = {}
@@ -130,7 +130,8 @@ Explain why you gave this score.
             prompt = build_prompt(metric)
 
             response = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=JUDGE_MODEL,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 messages=[{"role": "user", "content": prompt}]
             )
             content = response.choices[0].message.content

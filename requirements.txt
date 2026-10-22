@@ -16,7 +16,7 @@ pylatexenc
 ray[default]
 tensordict<0.6
 torchdata
-transformers
+transformers==4.46.3
 vllm<=0.6.3
 wandb
 
@@ -33,7 +33,7 @@ nano-vectordb
 neo4j
 networkx
 ollama
-openai
+openai<3.0.0
 oracledb
 pymilvus
 pymongo
@@ -46,7 +46,7 @@ tenacity
 
 # LLM packages
 tiktoken
-transformers
+transformers==4.46.3
 xxhash
 jsonlines
 nltk
@@ -55,3 +55,4 @@ fastapi
 uvicorn
 spacy
 
+tokenizers==0.20.3

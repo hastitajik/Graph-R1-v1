@@ -515,6 +515,19 @@ async def gpt_4o_mini_complete(
     )
 
 
+async def qwen38_complete(prompt, system_prompt=None, history_messages=[], **kwargs):
+    return await openai_complete_if_cache(
+        "Qwen3.8-27B",
+        prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+        base_url="http://192.168.4.114:5577/v1",
+        api_key="dummy",
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        **kwargs,
+    )
+
+
 async def nvidia_openai_complete(
     prompt, system_prompt=None, history_messages=[], keyword_extraction=False, **kwargs
 ) -> str:

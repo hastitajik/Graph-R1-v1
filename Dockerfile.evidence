@@ -1,0 +1,2 @@
+FROM graphr1:evidence-base
+RUN pip install --no-cache-dir "openai<3" networkx
