@@ -2,6 +2,7 @@ import os
 import json
 import time
 from graphr1 import GraphR1
+from graphr1.llm import qwen38_complete
 import argparse
 import numpy as np
 from FlagEmbedding import FlagAutoModel
@@ -107,7 +108,8 @@ def embed_knowledge(data_source):
 
 def insert_knowledge(data_source, unique_contexts):
     rag = GraphR1(
-        working_dir=f"expr/{data_source}"   
+        working_dir=f"expr/{data_source}",
+        llm_model_func=qwen38_complete
     )    
     extract_knowledge(rag, unique_contexts)
     embed_knowledge(data_source)

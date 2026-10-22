@@ -51,7 +51,7 @@ def evaluate_method(args):
 
     try:
         f1_dir_dict = dict()
-        for i in [0,10,20,30,40]:
+        for i in [0]:
             with open(os.path.join(dir, f"evals_step{i}.json")) as f:
                 data = json.load(f)
                 for item in data:
