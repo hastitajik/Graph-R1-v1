@@ -9,12 +9,11 @@ Provenance unit of an item = its Wikipedia article title(s) (see provenance.py).
 Items with unknown title all collapse into ONE "UNKNOWN" unit: they count for Coverage
 but are never counted as independent support.
 """
-import re
 from dataclasses import dataclass
 
+from evidence.common import VAR  # noqa: F401  (re-exported for callers that import it from here)
 from evidence.provenance import norm
 
-VAR = re.compile(r"\?[A-Za-z]\w*")
 UNKNOWN = "UNKNOWN"
 MIN_QUOTE = 10  # normalized characters
 
@@ -38,6 +37,7 @@ class EvidenceState:
         self.items = {}                              # item key -> Item
         self.support = {oid: {} for oid in self.obs}  # oid -> {item key: {var: value}}
         self.exhausted = set()                       # oids whose query returned nothing new
+        self.checked = set()                         # (item key, oid) pairs already shown to the matcher
         self._vars = {oid: VAR.findall(o["text"]) for oid, o in self.obs.items()}
 
     # ---- structure -------------------------------------------------------
@@ -80,6 +80,14 @@ class EvidenceState:
     def alt_values(self, var):
         """All distinct values seen for a variable (more than one = potential conflict)."""
         return [c["value"] for c in self._candidates(var).values()]
+
+    def conflicts(self):
+        """{var: [values]} for variables that have more than one distinct supported value.
+
+        Not used for decisions yet (the controller will read it); it is reported in the trace.
+        """
+        every = {v for oid in self.order for v in self._vars[oid]}
+        return {v: self.alt_values(v) for v in sorted(every) if len(self._candidates(v)) > 1}
 
     def bound(self, var):
         return self.value(var) is not None
@@ -130,6 +138,20 @@ class EvidenceState:
     def apply_match(self, oid, item_key, bindings):
         own = self.own_vars(oid)
         self.support[oid][item_key] = {v: bindings[v] for v in own if bindings.get(v)}
+
+    # ---- bookkeeping of what the matcher has already seen -------------------------
+    def unchecked(self, oid):
+        """Keys of held items that were never shown to the matcher for this obligation.
+
+        An item retrieved for one obligation may also state the fact another obligation needs,
+        but that other obligation was not 'ready' (a variable it depends on was unbound) when
+        the item arrived, so the matcher never looked at the pair. Once the obligation is
+        ready these items must be checked before spending a new query on it.
+        """
+        return [k for k in self.items if (k, oid) not in self.checked]
+
+    def mark_checked(self, keys, oids):
+        self.checked.update((k, o) for k in keys for o in oids)
 
     # ---- metrics (Layer 3 will extend) ---------------------------------------
     def covered(self, oid):

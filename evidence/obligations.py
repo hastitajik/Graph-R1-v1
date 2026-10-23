@@ -4,8 +4,9 @@ Layer 1 - Question -> Evidence Obligations O(q)
 One LLM call (frozen Qwen3.8-27B, temperature 0, thinking off), strict JSON output,
 validated, with retries. Run once per question, at the start of the loop.
 
-Usage (inside the graphr1 container):
-  python obligations.py --input datasets/2WikiMultiHopQA/raw/qa_dev.json \
+Usage (from the project root, inside the graphr1 container; the server and model come from
+EVIDENCE_LLM_BASE_URL / EVIDENCE_LLM_MODEL or --api-base / --model, see evidence/common.py):
+  python3 -m evidence.obligations --input datasets/2WikiMultiHopQA/raw/qa_dev.json \
       --n 30 --seed 0 --out obligations_dev30.jsonl
 """
 import argparse
@@ -17,8 +18,8 @@ from collections import Counter
 
 from openai import AsyncOpenAI
 
-BASE_URL = "http://192.168.4.114:5577/v1"
-MODEL = "Qwen3.8-27B"
+from evidence.common import LLM_BASE_URL as BASE_URL, LLM_MODEL as MODEL, VAR
+
 MAX_OBLIGATIONS = 6
 MAX_ATTEMPTS = 3
 VALID_TYPES = {"compositional", "comparison", "inference", "bridge_comparison", "other"}
@@ -37,6 +38,9 @@ values. Copy entity names exactly as written in the question, including any pare
 - kind = "retrieve": must be found in the corpus.
 - kind = "derive": computed from other obligations' values (compare dates, same country, \
 older/younger). It needs no retrieval.
+- Every ?variable is introduced by exactly ONE obligation. An obligation that uses a variable \
+introduced by another obligation must list that obligation in "depends_on". Two different \
+unknowns must have different names (?D1, ?D2), never the same name.
 - Use the fewest obligations possible (maximum 6). One fact = one obligation.
 - "answer_id" is the obligation that produces the final answer.
 - "type" is one of: compositional, comparison, inference, bridge_comparison, other.
@@ -145,6 +149,23 @@ def validate(obj: dict, question: str = None) -> list:
 
     if any(has_cycle(n) for n in graph):
         errs.append("dependency cycle")
+
+    # Variable discipline. EvidenceState keeps ONE global namespace of variables and only
+    # inherits a value from a DIRECT dependency, so a variable must have a single "root"
+    # obligation (where it is introduced); every other obligation that mentions it has to
+    # depend directly on an obligation that mentions it too. Otherwise two unrelated unknowns
+    # that share a name get merged, or a value is silently not inherited.
+    mentions = {}
+    for o in obs:
+        for v in dict.fromkeys(VAR.findall(str(o.get("text", "")))):
+            mentions.setdefault(v, []).append(o["id"])
+    deps_of = {o["id"]: set(o["depends_on"]) for o in obs if isinstance(o.get("depends_on"), list)}
+    for v, ms in mentions.items():
+        roots = [i for i in ms if i in deps_of and not (deps_of[i] & set(ms))]
+        if len(roots) > 1:
+            errs.append(
+                f"variable {v} is introduced independently in {', '.join(roots)}: give the "
+                f"unknowns different names, or add the missing depends_on")
     return errs
 
 

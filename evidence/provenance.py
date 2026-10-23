@@ -12,10 +12,11 @@ So the independence unit is the ARTICLE TITLE. Matching, in order:
   3. unknown : no title (kept as [] - treat as ONE shared unknown source, never independent)
 Duplicated articles in different docs collapse to the same title.
 
-Build once (a few minutes):
-  python evidence/provenance.py build
+Build once (a few minutes), from the project root:
+  python3 -m evidence.provenance build
 Inspect:
-  python evidence/provenance.py lookup '<hyperedge text>'
+  python3 -m evidence.provenance lookup '<hyperedge text>'
+The data folder defaults to expr/2WikiMultiHopQA; override it with EVIDENCE_DATA_DIR.
 
 Use in code:
   from evidence.provenance import ProvenanceIndex
@@ -29,7 +30,8 @@ import random
 import re
 from collections import Counter
 
-DATA_DIR = "expr/2WikiMultiHopQA"
+from evidence.common import DATA_DIR
+
 GRAPHML = f"{DATA_DIR}/graph_chunk_entity_relation.graphml"
 CHUNKS = f"{DATA_DIR}/kv_store_text_chunks.json"
 INDEX = f"{DATA_DIR}/provenance_index.json"

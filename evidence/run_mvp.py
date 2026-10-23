@@ -2,26 +2,37 @@
 MVP loop: Layers 1+2 with a single action (FillGap) and the simple stop rule
 "all retrieve-obligations covered". Retrieval = the existing /search API (unchanged).
 
-Run from the project root (inside the container):
+Run from the project root (inside the container). The endpoints come from the flags or from
+EVIDENCE_SEARCH_URL / EVIDENCE_LLM_BASE_URL / EVIDENCE_LLM_MODEL (see evidence/common.py):
   python3 -m evidence.run_mvp --obligations obligations_dev30.jsonl --n 5 \
       --search-url http://<API_IP>:8001/search \
-      --api-base http://192.168.4.114:5579/v1 --model alpha-Wolf --out trace_mvp.jsonl
+      --api-base http://<LLM_IP>:<PORT>/v1 --model <model-name> --out trace_mvp.jsonl
+
+Per target obligation a round does, in order:
+  (a) recheck - show the matcher the items already held that were never checked against this
+      obligation (they were retrieved for another obligation while this one was not ready yet);
+  (b) query   - only if (a) did not cover it: one new search, new items go to the matcher.
+An obligation is "exhausted" only when a query brought nothing new AND nothing is left to recheck.
 """
 import argparse
 import asyncio
 import json
 import re
-import string
+import time
+import urllib.error
 import urllib.request
+from collections import Counter
 
 from openai import AsyncOpenAI
 
+from evidence.common import LLM_BASE_URL, LLM_MODEL, SEARCH_URL
+from evidence.metrics import em_f1, normalize_answer  # noqa: F401  (normalize_answer re-exported)
 from evidence.obligations import extract_json
 from evidence.provenance import ProvenanceIndex, clean_hyperedge, norm
-from evidence.state import EvidenceState
+from evidence.state import UNKNOWN as UNK, EvidenceState
 
 PASSAGE_CHARS = 700
-UNK = "UNKNOWN"
+MAP_BATCH = 10  # passages per matcher call
 VERBOSE = False
 
 MAP_SYSTEM = """You check whether evidence passages support obligations.
@@ -70,14 +81,24 @@ def parse_results(raw):
     return out
 
 
-def retrieve_sync(url, query, timeout=180):
-    req = urllib.request.Request(url, data=json.dumps({"queries": [query]}).encode(),
-                                 headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+def retrieve_sync(url, query, timeout=180, retries=3):
+    """POST one query to /search. Network errors and bad JSON are retried with a growing pause."""
+    body = json.dumps({"queries": [query]}).encode()
+    last = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except (OSError, ValueError, urllib.error.URLError) as e:  # URLError/timeouts are OSError
+            last = e
+            if attempt < retries - 1:
+                time.sleep(2 * (attempt + 1))
+    raise last
 
 
 async def map_passages(client, model, state, new_keys, ready_oids):
-    """One LLM call: which new passages support which ready obligations. Returns validated matches."""
+    """One LLM call: which passages support which ready obligations. Returns validated matches."""
     items = [state.items[k] for k in new_keys]
     obs = "\n".join(f"{oid}: {state.instantiate(oid)}" for oid in ready_oids)
     pas = "\n".join(f"[{i}] {it.text[:PASSAGE_CHARS]}" for i, it in enumerate(items))
@@ -111,25 +132,27 @@ async def map_passages(client, model, state, new_keys, ready_oids):
     return good, rejected, items, dbg
 
 
-def normalize_answer(s: str) -> str:
-    s = (s or "").lower()
-    s = "".join(ch for ch in s if ch not in set(string.punctuation))
-    s = re.sub(r"\b(a|an|the)\b", " ", s)
-    return " ".join(s.split())
+async def map_and_apply(client, model, state, keys, oids):
+    """Show the items `keys` to the matcher against obligations `oids` and apply the validated matches.
 
-
-def em_f1(pred: str, golds):
-    """Max over gold aliases (SQuAD-style). Quick signal only - verify against the repo's eval before comparing with the baseline."""
-    best_em, best_f1 = 0.0, 0.0
-    p = normalize_answer(pred).split()
-    for g in golds or []:
-        gt = normalize_answer(str(g)).split()
-        best_em = max(best_em, float(p == gt))
-        common = sum((__import__("collections").Counter(p) & __import__("collections").Counter(gt)).values())
-        if common and p and gt:
-            pr, rc = common / len(p), common / len(gt)
-            best_f1 = max(best_f1, 2 * pr * rc / (pr + rc))
-    return best_em, best_f1
+    Returns (matched, rejected, dbg) for the trace. A pair is marked as checked only when the
+    LLM call worked, so a failed call is retried in a later round instead of being forgotten.
+    """
+    matched, rejected, dbgs = [], [], []
+    for i in range(0, len(keys), MAP_BATCH):
+        batch = keys[i:i + MAP_BATCH]
+        good, rej, _, dbg = await map_passages(client, model, state, batch, oids)
+        for m, _ in good:
+            state.apply_match(m["obligation"], batch[int(m["passage"])], m.get("bindings") or {})
+        if not dbg["error"]:
+            state.mark_checked(batch, oids)
+        matched += [(m["obligation"], m.get("bindings")) for m, _ in good]
+        rejected += [(m.get("obligation"), why) for m, why in rej]
+        dbgs.append(dbg)
+    dbg = {"error": next((d["error"] for d in dbgs if d["error"]), None),
+           "raw_text": dbgs[0]["raw_text"] if dbgs else None,
+           "proposed": sum(d["proposed"] for d in dbgs)}
+    return matched, rejected, dbg
 
 
 ANSWER_SYSTEM = """Answer the question using ONLY the established facts below.
@@ -180,21 +203,33 @@ async def solve(client, args, prov, rec):
         for oid in targets:
             if state.covered(oid):
                 continue
+
+            # (a) items we already hold but never checked against this obligation
+            pending = state.unchecked(oid)
+            if pending:
+                matched, rejected, dbg = await map_and_apply(client, args.model, state, pending, [oid])
+                log.append({"round": rnd, "obligation": oid, "phase": "recheck", "items": len(pending),
+                            "matched": matched, "rejected": rejected, "llm": dbg,
+                            "passages": [(state.items[k].titles, state.items[k].text[:110]) for k in pending]})
+                if state.covered(oid):
+                    continue
+
+            # (b) a new query
             q = make_query(state.instantiate(oid))
             res = parse_results(await asyncio.to_thread(retrieve_sync, args.search_url, q))
             new = state.add_items(res, rnd, q)
-            entry = {"round": rnd, "obligation": oid, "query": q, "returned": len(res), "new": len(new)}
+            entry = {"round": rnd, "obligation": oid, "phase": "query", "query": q,
+                     "returned": len(res), "new": len(new)}
             if not new:
-                state.exhausted.add(oid)
-                entry["note"] = "no new evidence"
+                if not state.unchecked(oid):  # nothing new and nothing left to recheck: really exhausted
+                    state.exhausted.add(oid)
+                    entry["note"] = "no new evidence"
                 log.append(entry)
                 continue
             ready = [o for o in state.order if state.ready(o)]
-            good, rejected, items, dbg = await map_passages(client, args.model, state, new, ready)
-            for m, _ in good:
-                state.apply_match(m["obligation"], new[int(m["passage"])], m.get("bindings") or {})
-            entry["matched"] = [(m["obligation"], m.get("bindings")) for m, _ in good]
-            entry["rejected"] = [(m.get("obligation"), why) for m, why in rejected]
+            matched, rejected, dbg = await map_and_apply(client, args.model, state, new, ready)
+            entry["matched"] = matched
+            entry["rejected"] = rejected
             entry["llm"] = dbg
             entry["passages"] = [(state.items[k].titles, state.items[k].text[:110]) for k in new]
             log.append(entry)
@@ -209,12 +244,20 @@ async def solve(client, args, prov, rec):
     if ans_kind == "retrieve":
         vn = [norm(v) for v in vals.values()]
         gold_hit = any(norm(g) and any(norm(g) in v or v in norm(g) for v in vn if v) for g in gold)
-    ans, ans_err = await answer_question(client, args.model, state, rec["question"])
+
+    uncovered = [o for o in state.order if state.is_retrieve(o) and not state.covered(o)]
+    abstained = bool(uncovered) and args.abstain_incomplete
+    if abstained:
+        ans, ans_err = "", None
+    else:
+        ans, ans_err = await answer_question(client, args.model, state, rec["question"])
     em, f1 = em_f1(ans, gold)
     return {
         "answer": ans, "answer_error": ans_err, "em": em, "f1": f1,
         "question": rec["question"], "gold": gold, "coverage": state.coverage(), "stop": stop,
-        "bindings": vals, "gold_in_bindings": gold_hit, "log": log,
+        "uncovered": uncovered, "exhausted": sorted(state.exhausted),
+        "abstained": abstained, "answered_from_incomplete": bool(uncovered) and not abstained,
+        "bindings": vals, "conflicts": state.conflicts(), "gold_in_bindings": gold_hit, "log": log,
         "obligations": [{"id": o, "kind": state.obs[o]["kind"], "text": state.instantiate(o),
                          "covered": state.covered(o), "kappa": state.kappa(o),
                          "titles": sorted({t for k in state.support[o] for t in (state.items[k].titles or [UNK])})}
@@ -226,8 +269,12 @@ async def solve(client, args, prov, rec):
 def show(r):
     print("\nQ:", r["question"], "| gold:", str(r["gold"])[:50])
     for e in r["log"]:
-        print(f"  r{e['round']} {e['obligation']} q='{e['query'][:70]}' returned={e['returned']} new={e['new']}"
-              f" matched={e.get('matched', [])} {e.get('note', '')}")
+        if e.get("phase") == "recheck":
+            print(f"  r{e['round']} {e['obligation']} recheck of {e['items']} held item(s)"
+                  f" matched={e.get('matched', [])}")
+        else:
+            print(f"  r{e['round']} {e['obligation']} q='{e['query'][:70]}' returned={e['returned']} new={e['new']}"
+                  f" matched={e.get('matched', [])} {e.get('note', '')}")
         if e.get("llm"):
             print(f"     llm: proposed={e['llm']['proposed']} error={e['llm']['error']}")
         if e.get("rejected"):
@@ -239,11 +286,13 @@ def show(r):
     for o in r["obligations"]:
         mark = "OK" if o["covered"] else ("--" if o["kind"] == "retrieve" else "dv")
         print(f"  [{mark}] {o['id']} k={o['kappa']} {o['text']}  {o['titles']}")
-    print(f"  coverage={r['coverage']:.2f} stop={r['stop']} bindings={r['bindings']} gold_in_bindings={r['gold_in_bindings']}")
+    print(f"  coverage={r['coverage']:.2f} stop={r['stop']} bindings={r['bindings']} "
+          f"conflicts={r.get('conflicts', {})} gold_in_bindings={r['gold_in_bindings']}")
 
 
 def compact(i, r):
-    print(f"[{i}] cov={r['coverage']:.2f} stop={r['stop']} EM={r['em']:.0f} ans='{r['answer'][:40]}' "
+    tag = " ABSTAIN" if r.get("abstained") else (" GUESS" if r.get("answered_from_incomplete") else "")
+    print(f"[{i}] cov={r['coverage']:.2f} stop={r['stop']}{tag} EM={r['em']:.0f} ans='{r['answer'][:40]}' "
           f"gold={[str(g)[:25] for g in (r['gold'] or [])[:2]]} | {r['question'][:70]}")
 
 
@@ -254,13 +303,17 @@ async def main():
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--max-rounds", type=int, default=6)
     ap.add_argument("--concurrency", type=int, default=3)
-    ap.add_argument("--search-url", required=True)
-    ap.add_argument("--api-base", required=True)
-    ap.add_argument("--model", required=True)
+    ap.add_argument("--search-url", default=SEARCH_URL, help="Graph-R1 /search API (or EVIDENCE_SEARCH_URL)")
+    ap.add_argument("--api-base", default=LLM_BASE_URL, help="LLM server (or EVIDENCE_LLM_BASE_URL)")
+    ap.add_argument("--model", default=LLM_MODEL, help="LLM name (or EVIDENCE_LLM_MODEL)")
+    ap.add_argument("--abstain-incomplete", action="store_true",
+                    help="return an empty answer instead of a best guess when an obligation is not covered")
     ap.add_argument("--out", default="trace_mvp.jsonl")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--show", action="store_true", help="full per-question trace without raw passages")
     args = ap.parse_args()
+    if not args.search_url:
+        ap.error("--search-url (or EVIDENCE_SEARCH_URL) is required")
     global VERBOSE
     VERBOSE = args.verbose
 
@@ -286,7 +339,8 @@ async def main():
             except Exception as e:  # keep the batch alive, record the failure
                 return i, {"question": rec["question"], "gold": rec.get("gold"), "coverage": 0.0,
                            "stop": f"crash: {type(e).__name__}: {e}"[:120], "answer": "", "answer_error": None,
-                           "em": 0.0, "f1": 0.0, "log": [], "n_items": 0, "bindings": {},
+                           "em": 0.0, "f1": 0.0, "log": [], "n_items": 0, "bindings": {}, "conflicts": {},
+                           "uncovered": [], "exhausted": [], "abstained": False, "answered_from_incomplete": False,
                            "gold_in_bindings": None, "obligations": []}
 
     results = {}
@@ -308,7 +362,9 @@ async def main():
     print(f"\n==== {len(rs)} questions | model={args.model}")
     print(f"EM={avg(rs,'em'):.3f} F1={avg(rs,'f1'):.3f} | avg items={sum(r['n_items'] for r in rs)/n:.1f}")
     print(f"fully covered: {len(full)}/{len(rs)}  EM={avg(full,'em'):.3f}  |  not fully covered: {len(part)}  EM={avg(part,'em'):.3f}")
-    print("stop reasons:", dict(__import__("collections").Counter(r["stop"].split(":")[0] for r in rs)))
+    print(f"not fully covered: abstained={sum(bool(r.get('abstained')) for r in part)} "
+          f"answered-by-guess={sum(bool(r.get('answered_from_incomplete')) for r in part)}")
+    print("stop reasons:", dict(Counter(r["stop"].split(":")[0] for r in rs)))
     errs = sum(1 for r in rs for e in r["log"] if (e.get("llm") or {}).get("error")) + sum(1 for r in rs if r.get("answer_error"))
     if errs:
         print(f"!! {errs} LLM call(s) failed - these results are NOT valid")

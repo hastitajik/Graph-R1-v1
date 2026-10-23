@@ -7,10 +7,12 @@ is the gold answer retrievable at all (retrieval miss) or was it retrieved but n
 (mapping miss)? Yes/no questions have no gold span, so they are only summarized.
 
   python3 -m evidence.diag --trace trace_bonsai30.jsonl --search-url http://<IP>:8001/search
+(--search-url defaults to EVIDENCE_SEARCH_URL)
 """
 import argparse
 import json
 
+from evidence.common import SEARCH_URL
 from evidence.provenance import norm
 from evidence.run_mvp import make_query, parse_results, retrieve_sync
 
@@ -26,8 +28,10 @@ def first_hit(results, golds):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trace", required=True)
-    ap.add_argument("--search-url", required=True)
+    ap.add_argument("--search-url", default=SEARCH_URL)
     args = ap.parse_args()
+    if not args.search_url:
+        ap.error("--search-url (or EVIDENCE_SEARCH_URL) is required")
     recs = [json.loads(l) for l in open(args.trace, encoding="utf-8")]
     for i, r in enumerate(recs):
         if r["em"] == 1:
