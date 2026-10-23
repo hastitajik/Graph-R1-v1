@@ -1,0 +1,225 @@
+diff --git a/evidence/compare.py b/evidence/compare.py
+new file mode 100644
+index 0000000..474819a
+--- /dev/null
++++ b/evidence/compare.py
+@@ -0,0 +1,40 @@
++"""Question-by-question comparison of two traces, using the repo's official eval.py.
++
++  python3 -m evidence.compare trace_v1.jsonl trace_v2.jsonl
++"""
++import json
++import sys
++
++from eval import cal_em, cal_f1
++
++
++def load(path):
++    return {r["question"]: r for r in (json.loads(l) for l in open(path, encoding="utf-8"))}
++
++
++def score(r):
++    return cal_em([r["gold"] or []], [r["answer"]])
++
++
++def main(pa, pb):
++    a, b = load(pa), load(pb)
++    qs = [q for q in a if q in b]
++    print(f"common questions: {len(qs)} (v1 {len(a)}, v2 {len(b)})")
++    for name, d in (("v1", a), ("v2", b)):
++        g = [d[q]["gold"] or [] for q in qs]
++        p = [d[q]["answer"] for q in qs]
++        ab = sum(bool(d[q].get("abstain")) for q in qs)
++        print(f"{name}: EM={cal_em(g, p):.3f} F1={cal_f1(g, p):.3f} abstained={ab}")
++    gained = [q for q in qs if score(a[q]) < 1 <= score(b[q])]
++    lost = [q for q in qs if score(a[q]) >= 1 > score(b[q])]
++    wrong_to_abstain = [q for q in qs if score(a[q]) < 1 and b[q].get("abstain") and not a[q].get("abstain")]
++    print(f"\nGAINED ({len(gained)}):")
++    for q in gained: print("  +", q[:90], "->", b[q]["answer"])
++    print(f"\nLOST ({len(lost)})  <- must be empty or explained:")
++    for q in lost: print("  -", q[:90], "|", a[q]["answer"], "->", b[q]["answer"] or "<ABSTAIN>")
++    print(f"\nWRONG GUESS -> ABSTAIN ({len(wrong_to_abstain)}):")
++    for q in wrong_to_abstain: print("  ~", q[:90], "| was:", a[q]["answer"][:30])
++
++
++if __name__ == "__main__":
++    main(sys.argv[1], sys.argv[2])
+diff --git a/evidence/run_mvp.py b/evidence/run_mvp.py
+index 4fe7549..0f347d9 100644
+--- a/evidence/run_mvp.py
++++ b/evidence/run_mvp.py
+@@ -20,7 +20,7 @@ from evidence.obligations import extract_json
+ from evidence.provenance import ProvenanceIndex, clean_hyperedge, norm
+ from evidence.state import EvidenceState
+ 
+-PASSAGE_CHARS = 700
++PASSAGE_CHARS = 1500
+ UNK = "UNKNOWN"
+ VERBOSE = False
+ 
+@@ -31,6 +31,12 @@ passage EXPLICITLY states that fact. Use only the passage, never outside knowled
+ If it does, return the value of every ?variable in the obligation exactly as written in \
+ the passage, and copy a short quote (the exact words) that states the fact.
+ Skip passages that merely mention the entity without stating the fact.
++Each passage is labelled with the title of its source article. If the passage uses a pronoun \
++(He/She/It/The film), it is about that article's subject.
++Reading "(born date, place - died date, place)" parentheses is allowed. Close synonyms count \
++(educated at = graduated from, half-brother = brother).
++Return bindings ONLY for the ?variables of the obligation you are matching, and make the value \
++the right kind of thing (a place for "died in", a date for "born on"), not just any text.
+ 
+ Return ONLY a JSON object:
+ {"matches":[{"passage":0,"obligation":"o1","bindings":{"?D":"value"},"quote":"exact words"}]}
+@@ -80,7 +86,8 @@ async def map_passages(client, model, state, new_keys, ready_oids):
+     """One LLM call: which new passages support which ready obligations. Returns validated matches."""
+     items = [state.items[k] for k in new_keys]
+     obs = "\n".join(f"{oid}: {state.instantiate(oid)}" for oid in ready_oids)
+-    pas = "\n".join(f"[{i}] {it.text[:PASSAGE_CHARS]}" for i, it in enumerate(items))
++    pas = "\n".join(f"[{i}] (article: {', '.join(it.titles) or 'unknown'}) {it.text[:PASSAGE_CHARS]}"
++                    for i, it in enumerate(items))
+     user = f"Obligations:\n{obs}\n\nPassages:\n{pas}"
+     raw = None
+     dbg = {"error": None, "raw_text": None, "proposed": 0}
+@@ -104,7 +111,15 @@ async def map_passages(client, model, state, new_keys, ready_oids):
+     for m in (raw or {}).get("matches", []):
+         try:
+             item = items[int(m["passage"])]
+-            ok, why = state.validate_match(m["obligation"], item, m.get("bindings") or {}, m.get("quote", ""))
++            b = m.get("bindings") or {}
++            # the model often writes the wrong obligation id: the variable decides who owns the match
++            owners = {state.owner_of(v) for v in b} - {None}
++            if len(owners) == 1:
++                m["obligation"] = next(iter(owners))
++            if m["obligation"] not in ready_oids:
++                ok, why = False, f"{m['obligation']} was not requested (already covered or not ready)"
++            else:
++                ok, why = state.validate_match(m["obligation"], item, b, m.get("quote", ""))
+         except Exception as e:
+             ok, why = False, f"bad match: {e}"
+         (good if ok else rejected).append((m, why))
+@@ -135,8 +150,8 @@ def em_f1(pred: str, golds):
+ ANSWER_SYSTEM = """Answer the question using ONLY the established facts below.
+ Compare values when the question asks for it (earlier/later, older/younger, same country).
+ Give a SHORT answer: a name, date, place, or yes/no. For "which film/person" questions answer \
+-with the name exactly as written in the question. If a fact is marked NOT FOUND, make your \
+-best guess from the remaining facts.
++with the name exactly as written in the question. Every fact below is established; do not use \
++outside knowledge.
+ Return ONLY JSON: {"answer": "..."}"""
+ 
+ 
+@@ -189,7 +204,7 @@ async def solve(client, args, prov, rec):
+                 entry["note"] = "no new evidence"
+                 log.append(entry)
+                 continue
+-            ready = [o for o in state.order if state.ready(o)]
++            ready = [o for o in state.order if state.ready(o) and not state.covered(o)]
+             good, rejected, items, dbg = await map_passages(client, args.model, state, new, ready)
+             for m, _ in good:
+                 state.apply_match(m["obligation"], new[int(m["passage"])], m.get("bindings") or {})
+@@ -209,10 +224,15 @@ async def solve(client, args, prov, rec):
+     if ans_kind == "retrieve":
+         vn = [norm(v) for v in vals.values()]
+         gold_hit = any(norm(g) and any(norm(g) in v or v in norm(g) for v in vn if v) for g in gold)
+-    ans, ans_err = await answer_question(client, args.model, state, rec["question"])
++    unmet = [o for o in state.order if state.is_retrieve(o) and not state.covered(o)]
++    abstain = bool(unmet)          # evidence incomplete -> do NOT guess
++    if abstain:
++        ans, ans_err = "", None
++    else:
++        ans, ans_err = await answer_question(client, args.model, state, rec["question"])
+     em, f1 = em_f1(ans, gold)
+     return {
+-        "answer": ans, "answer_error": ans_err, "em": em, "f1": f1,
++        "answer": ans, "answer_error": ans_err, "em": em, "f1": f1, "abstain": abstain, "unmet": unmet,
+         "question": rec["question"], "gold": gold, "coverage": state.coverage(), "stop": stop,
+         "bindings": vals, "gold_in_bindings": gold_hit, "log": log,
+         "obligations": [{"id": o, "kind": state.obs[o]["kind"], "text": state.instantiate(o),
+@@ -243,7 +263,8 @@ def show(r):
+ 
+ 
+ def compact(i, r):
+-    print(f"[{i}] cov={r['coverage']:.2f} stop={r['stop']} EM={r['em']:.0f} ans='{r['answer'][:40]}' "
++    print(f"[{i}] cov={r['coverage']:.2f} stop={r['stop']} EM={r['em']:.0f} "
++          f"ans='{'<ABSTAIN>' if r.get('abstain') else r['answer'][:40]}' "
+           f"gold={[str(g)[:25] for g in (r['gold'] or [])[:2]]} | {r['question'][:70]}")
+ 
+ 
+@@ -306,7 +327,9 @@ async def main():
+     part = [r for r in rs if r["coverage"] < 1]
+     avg = lambda xs, k: (sum(x[k] for x in xs) / len(xs)) if xs else float("nan")
+     print(f"\n==== {len(rs)} questions | model={args.model}")
+-    print(f"EM={avg(rs,'em'):.3f} F1={avg(rs,'f1'):.3f} | avg items={sum(r['n_items'] for r in rs)/n:.1f}")
++    answered = [r for r in rs if not r.get("abstain")]
++    print(f"EM={avg(rs,'em'):.3f} F1={avg(rs,'f1'):.3f} (abstain counted as wrong) | avg items={sum(r['n_items'] for r in rs)/n:.1f}")
++    print(f"answered: {len(answered)}/{len(rs)} | abstained: {len(rs)-len(answered)} | EM on answered only={avg(answered,'em'):.3f}")
+     print(f"fully covered: {len(full)}/{len(rs)}  EM={avg(full,'em'):.3f}  |  not fully covered: {len(part)}  EM={avg(part,'em'):.3f}")
+     print("stop reasons:", dict(__import__("collections").Counter(r["stop"].split(":")[0] for r in rs)))
+     errs = sum(1 for r in rs for e in r["log"] if (e.get("llm") or {}).get("error")) + sum(1 for r in rs if r.get("answer_error"))
+diff --git a/evidence/state.py b/evidence/state.py
+index e07a9bf..85439e0 100644
+--- a/evidence/state.py
++++ b/evidence/state.py
+@@ -18,6 +18,21 @@ VAR = re.compile(r"\?[A-Za-z]\w*")
+ UNKNOWN = "UNKNOWN"
+ MIN_QUOTE = 10  # normalized characters
+ 
++# ---- variable typing (cheap guard against "died in ?P" = 1515) -------------------
++MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
++DATE_CUE = re.compile(r"\b(?:born|died|released|published|founded|married|established|premiered|opened)\s+on$"
++                      r"|\bdate of (?:birth|death)\b.*\bis$")
++PLACE_CUE = re.compile(r"\b(?:born|died|buried|located|produced|filmed|based|graduated|educated|studied|raised)\s+(?:in|at|from)$"
++                       r"|\b(?:from|citizen of|native of)$"
++                       r"|\b(?:nationality|country|place of (?:birth|death)|birthplace|city)\b.*\bis$")
++
++
++def date_only(v: str) -> bool:
++    """True if the value is nothing but a date/year (no place or name words)."""
++    s = re.sub(rf"\b{MONTH}\b", " ", v.lower())
++    s = re.sub(r"\b(?:c|ca|circa|ad|bc|bce|ce|th|st|nd|rd|of|the)\b", " ", s)
++    return re.sub(r"[\d\W_]+", "", s) == "" and bool(re.search(r"\d", v))
++
+ 
+ @dataclass
+ class Item:
+@@ -54,6 +69,30 @@ class EvidenceState:
+         dv = self.dep_vars(oid)
+         return [v for v in dict.fromkeys(self._vars[oid]) if v not in dv]
+ 
++    def owner_of(self, var):
++        """The retrieve obligation that introduces `var` (own var, not inherited from a dependency)."""
++        for oid in self.order:
++            if self.is_retrieve(oid) and var in self.own_vars(oid):
++                return oid
++        return None
++
++    def expected_type(self, oid, var):
++        """'date' / 'place' / None, read from the words just before the variable in the obligation text."""
++        tail = " ".join(self.obs[oid]["text"].split(var)[0].lower().split()[-6:])
++        if DATE_CUE.search(tail):
++            return "date"
++        if PLACE_CUE.search(tail):
++            return "place"
++        return None
++
++    def type_ok(self, oid, var, val):
++        t = self.expected_type(oid, var)
++        if t == "date" and not re.search(r"\d{3,4}", val):
++            return False, f"type mismatch: {var} expects a date, got '{val}'"
++        if t == "place" and date_only(val):
++            return False, f"type mismatch: {var} expects a place, got date '{val}'"
++        return True, ""
++
+     # ---- bindings ---------------------------------------------------------
+     def _candidates(self, var):
+         """normalized value -> {"value": str, "items": set(item keys)}"""
+@@ -125,6 +164,9 @@ class EvidenceState:
+             val = (bindings or {}).get(v)
+             if not val or norm(val) not in body:
+                 return False, f"binding {v} missing or not in passage"
++            ok, why = self.type_ok(oid, v, val)
++            if not ok:
++                return False, why
+         return True, ""
+ 
+     def apply_match(self, oid, item_key, bindings):

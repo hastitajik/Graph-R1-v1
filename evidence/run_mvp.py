@@ -17,10 +17,12 @@ import urllib.request
 from openai import AsyncOpenAI
 
 from evidence.obligations import extract_json
+from evidence.audit import audit
+from evidence.controller import plan
 from evidence.provenance import ProvenanceIndex, clean_hyperedge, norm
 from evidence.state import EvidenceState
 
-PASSAGE_CHARS = 700
+PASSAGE_CHARS = 1500
 UNK = "UNKNOWN"
 VERBOSE = False
 
@@ -31,6 +33,12 @@ passage EXPLICITLY states that fact. Use only the passage, never outside knowled
 If it does, return the value of every ?variable in the obligation exactly as written in \
 the passage, and copy a short quote (the exact words) that states the fact.
 Skip passages that merely mention the entity without stating the fact.
+Each passage is labelled with the title of its source article. If the passage uses a pronoun \
+(He/She/It/The film), it is about that article's subject.
+Reading "(born date, place - died date, place)" parentheses is allowed. Close synonyms count \
+(educated at = graduated from, half-brother = brother).
+Return bindings ONLY for the ?variables of the obligation you are matching. A year alone \
+(for example "1926") is a valid value for a date variable.
 
 Return ONLY a JSON object:
 {"matches":[{"passage":0,"obligation":"o1","bindings":{"?D":"value"},"quote":"exact words"}]}
@@ -79,8 +87,9 @@ def retrieve_sync(url, query, timeout=180):
 async def map_passages(client, model, state, new_keys, ready_oids):
     """One LLM call: which new passages support which ready obligations. Returns validated matches."""
     items = [state.items[k] for k in new_keys]
-    obs = "\n".join(f"{oid}: {state.instantiate(oid)}" for oid in ready_oids)
-    pas = "\n".join(f"[{i}] {it.text[:PASSAGE_CHARS]}" for i, it in enumerate(items))
+    obs = "\n".join(f"{oid}: {state.instantiate_open(oid)}" for oid in ready_oids)
+    pas = "\n".join(f"[{i}] (article: {', '.join(it.titles) or 'unknown'}) {it.text[:PASSAGE_CHARS]}"
+                    for i, it in enumerate(items))
     user = f"Obligations:\n{obs}\n\nPassages:\n{pas}"
     raw = None
     dbg = {"error": None, "raw_text": None, "proposed": 0}
@@ -104,7 +113,15 @@ async def map_passages(client, model, state, new_keys, ready_oids):
     for m in (raw or {}).get("matches", []):
         try:
             item = items[int(m["passage"])]
-            ok, why = state.validate_match(m["obligation"], item, m.get("bindings") or {}, m.get("quote", ""))
+            b = m.get("bindings") or {}
+            # the model often writes the wrong obligation id: the variable decides who owns the match
+            owners = {state.owner_of(v) for v in b} - {None}
+            if len(owners) == 1:
+                m["obligation"] = next(iter(owners))
+            if m["obligation"] not in ready_oids:
+                ok, why = False, f"{m['obligation']} was not requested (already covered or not ready)"
+            else:
+                ok, why = state.validate_match(m["obligation"], item, b, m.get("quote", ""))
         except Exception as e:
             ok, why = False, f"bad match: {e}"
         (good if ok else rejected).append((m, why))
@@ -135,8 +152,8 @@ def em_f1(pred: str, golds):
 ANSWER_SYSTEM = """Answer the question using ONLY the established facts below.
 Compare values when the question asks for it (earlier/later, older/younger, same country).
 Give a SHORT answer: a name, date, place, or yes/no. For "which film/person" questions answer \
-with the name exactly as written in the question. If a fact is marked NOT FOUND, make your \
-best guess from the remaining facts.
+with the name exactly as written in the question. Every fact below is established; do not use \
+outside knowledge.
 Return ONLY JSON: {"answer": "..."}"""
 
 
@@ -168,10 +185,75 @@ async def answer_question(client, model, state, question):
     return "", err
 
 
+ALT_SYSTEM = """You write ONE alternative search query that should retrieve a DIFFERENT source \
+stating the same fact (use synonyms, the full name, or a closely related entity). Do not answer \
+it and do not repeat a previous query.
+Return ONLY JSON: {"query": "..."}"""
+
+
+async def alt_query(client, model, text, used):
+    user = f"Fact to find: {text}\nQueries already used: {json.dumps(used, ensure_ascii=False)}"
+    try:
+        resp = await client.chat.completions.create(
+            model=model, temperature=0,
+            messages=[{"role": "system", "content": ALT_SYSTEM}, {"role": "user", "content": user}],
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+        q = str(extract_json(resp.choices[0].message.content or "").get("query", "")).strip()
+    except Exception:
+        q = ""
+    return q if q and q not in used else ""
+
+
+async def vne_loop(client, args, state, log):
+    """Decision-time controller: re-plan after every action, stop when no action has VNE > 0."""
+    diversified, used = set(), {}
+    for step in range(1, args.max_actions + 1):
+        before = audit(state, args.lam_x, args.lam_r)
+        acts = plan(state, args.lam_r, args.cost, diversified)
+        if not acts:
+            return "vne_stop"
+        a = acts[0]
+        oid = a["oid"]
+        text = state.instantiate(oid)
+        entry = {"round": step, "action": a["action"], "obligation": oid, "vne": round(a["vne"], 3),
+                 "risk_before": before["risk"]}
+        if a["action"] == "FillGap":
+            q = make_query(text)
+        else:
+            diversified.add(oid)          # one attempt per obligation in v0
+            q = await alt_query(client, args.model, text, used.get(oid, []))
+            if not q:
+                entry["note"] = "no alternative query"
+                log.append(entry)
+                continue
+        used.setdefault(oid, []).append(q)
+        res = parse_results(await asyncio.to_thread(retrieve_sync, args.search_url, q))
+        new = state.add_items(res, step, q)
+        k_before = state.kappa(oid)
+        entry.update({"query": q, "returned": len(res), "new": len(new)})
+        if new:
+            targets = list(dict.fromkeys([oid] + [o for o in state.order if state.ready(o) and not state.covered(o)]))
+            good, rejected, items, dbg = await map_passages(client, args.model, state, new, targets)
+            for m, _ in good:
+                state.apply_match(m["obligation"], new[int(m["passage"])], m.get("bindings") or {})
+            entry["matched"] = [(m["obligation"], m.get("bindings")) for m, _ in good]
+            entry["rejected"] = [(m.get("obligation"), why) for m, why in rejected]
+            entry["llm"] = dbg
+        if a["action"] == "FillGap" and not state.covered(oid):
+            state.exhausted.add(oid)       # the same query would return the same passages
+        entry["kappa_gain"] = state.kappa(oid) - k_before
+        entry["risk_after"] = audit(state, args.lam_x, args.lam_r)["risk"]
+        log.append(entry)
+    return "max_actions"
+
+
 async def solve(client, args, prov, rec):
     state = EvidenceState(rec["obligations"], prov)
     log, stop = [], "max_rounds"
-    for rnd in range(1, args.max_rounds + 1):
+    use_vne = getattr(args, "mode", "fillgap") == "vne"
+    if use_vne:
+        stop = await vne_loop(client, args, state, log)
+    for rnd in (() if use_vne else range(1, args.max_rounds + 1)):
         targets = [o for o in state.order if state.is_retrieve(o) and not state.covered(o)
                    and state.ready(o) and o not in state.exhausted]
         if not targets:
@@ -189,7 +271,7 @@ async def solve(client, args, prov, rec):
                 entry["note"] = "no new evidence"
                 log.append(entry)
                 continue
-            ready = [o for o in state.order if state.ready(o)]
+            ready = [o for o in state.order if state.ready(o) and not state.covered(o)]
             good, rejected, items, dbg = await map_passages(client, args.model, state, new, ready)
             for m, _ in good:
                 state.apply_match(m["obligation"], new[int(m["passage"])], m.get("bindings") or {})
@@ -199,7 +281,7 @@ async def solve(client, args, prov, rec):
             entry["passages"] = [(state.items[k].titles, state.items[k].text[:110]) for k in new]
             log.append(entry)
     else:
-        if state.coverage() == 1:
+        if not use_vne and state.coverage() == 1:
             stop = "all_covered"
 
     vals = state.all_values()
@@ -209,10 +291,17 @@ async def solve(client, args, prov, rec):
     if ans_kind == "retrieve":
         vn = [norm(v) for v in vals.values()]
         gold_hit = any(norm(g) and any(norm(g) in v or v in norm(g) for v in vn if v) for g in gold)
-    ans, ans_err = await answer_question(client, args.model, state, rec["question"])
+    unmet = [o for o in state.order if state.is_retrieve(o) and not state.covered(o)]
+    abstain = bool(unmet)          # evidence incomplete -> do NOT guess
+    if abstain:
+        ans, ans_err = "", None
+    else:
+        ans, ans_err = await answer_question(client, args.model, state, rec["question"])
     em, f1 = em_f1(ans, gold)
     return {
-        "answer": ans, "answer_error": ans_err, "em": em, "f1": f1,
+        "answer": ans, "answer_error": ans_err, "em": em, "f1": f1, "abstain": abstain, "unmet": unmet,
+        "mode": "vne" if use_vne else "fillgap", "n_retrievals": sum(1 for e in log if e.get("query")),
+        "audit": audit(state, getattr(args, "lam_x", 0.5), getattr(args, "lam_r", 0.5)),
         "question": rec["question"], "gold": gold, "coverage": state.coverage(), "stop": stop,
         "bindings": vals, "gold_in_bindings": gold_hit, "log": log,
         "obligations": [{"id": o, "kind": state.obs[o]["kind"], "text": state.instantiate(o),
@@ -226,7 +315,10 @@ async def solve(client, args, prov, rec):
 def show(r):
     print("\nQ:", r["question"], "| gold:", str(r["gold"])[:50])
     for e in r["log"]:
-        print(f"  r{e['round']} {e['obligation']} q='{e['query'][:70]}' returned={e['returned']} new={e['new']}"
+        if "action" in e and "query" not in e:
+            print(f"  r{e['round']} {e['action']} {e['obligation']} vne={e['vne']} {e.get('note', '')}")
+            continue
+        print(f"  r{e['round']} {e.get('action', '')} {e['obligation']} q='{e['query'][:70]}' returned={e['returned']} new={e['new']}"
               f" matched={e.get('matched', [])} {e.get('note', '')}")
         if e.get("llm"):
             print(f"     llm: proposed={e['llm']['proposed']} error={e['llm']['error']}")
@@ -243,7 +335,8 @@ def show(r):
 
 
 def compact(i, r):
-    print(f"[{i}] cov={r['coverage']:.2f} stop={r['stop']} EM={r['em']:.0f} ans='{r['answer'][:40]}' "
+    print(f"[{i}] cov={r['coverage']:.2f} stop={r['stop']} EM={r['em']:.0f} "
+          f"ans='{'<ABSTAIN>' if r.get('abstain') else r['answer'][:40]}' "
           f"gold={[str(g)[:25] for g in (r['gold'] or [])[:2]]} | {r['question'][:70]}")
 
 
@@ -258,6 +351,12 @@ async def main():
     ap.add_argument("--api-base", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", default="trace_mvp.jsonl")
+    ap.add_argument("--mode", choices=["fillgap", "vne"], default="fillgap",
+                    help="fillgap = old loop (baseline); vne = decision-time controller")
+    ap.add_argument("--max-actions", type=int, default=8)
+    ap.add_argument("--lam-x", type=float, default=0.5, help="weight of conflict in Risk")
+    ap.add_argument("--lam-r", type=float, default=0.5, help="weight of weak support in Risk")
+    ap.add_argument("--cost", type=float, default=0.1, help="cost of one retrieval in VNE")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--show", action="store_true", help="full per-question trace without raw passages")
     args = ap.parse_args()
@@ -306,7 +405,11 @@ async def main():
     part = [r for r in rs if r["coverage"] < 1]
     avg = lambda xs, k: (sum(x[k] for x in xs) / len(xs)) if xs else float("nan")
     print(f"\n==== {len(rs)} questions | model={args.model}")
-    print(f"EM={avg(rs,'em'):.3f} F1={avg(rs,'f1'):.3f} | avg items={sum(r['n_items'] for r in rs)/n:.1f}")
+    answered = [r for r in rs if not r.get("abstain")]
+    print(f"EM={avg(rs,'em'):.3f} F1={avg(rs,'f1'):.3f} (abstain counted as wrong) | avg items={sum(r['n_items'] for r in rs)/n:.1f}")
+    print(f"mode={rs[0].get('mode')} | avg retrievals={sum(r.get('n_retrievals', 0) for r in rs)/n:.2f}"
+          f" | avg final risk={sum(r.get('audit', {}).get('risk', 0) for r in rs)/n:.3f}")
+    print(f"answered: {len(answered)}/{len(rs)} | abstained: {len(rs)-len(answered)} | EM on answered only={avg(answered,'em'):.3f}")
     print(f"fully covered: {len(full)}/{len(rs)}  EM={avg(full,'em'):.3f}  |  not fully covered: {len(part)}  EM={avg(part,'em'):.3f}")
     print("stop reasons:", dict(__import__("collections").Counter(r["stop"].split(":")[0] for r in rs)))
     errs = sum(1 for r in rs for e in r["log"] if (e.get("llm") or {}).get("error")) + sum(1 for r in rs if r.get("answer_error"))

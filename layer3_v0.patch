@@ -1,0 +1,228 @@
+diff --git a/evidence/audit.py b/evidence/audit.py
+new file mode 100644
+index 0000000..bc41e43
+--- /dev/null
++++ b/evidence/audit.py
+@@ -0,0 +1,43 @@
++"""Layer 3 (v0) - Evidence Audit and Risk. Pure functions over EvidenceState, no network.
++
++  C = coverage            share of retrieve-obligations that have evidence
++  R = robustness          mean over retrieve-obligations of min(kappa, 2) / 2
++                          (kappa = independent provenance units: 0 none, 1 fragile, >=2 robust)
++  X = conflict rate       share of bound variables that carry more than one distinct value
++  Risk(s) = (1 - C) + lam_x * X + lam_r * (1 - R)          lam_x, lam_r are fixed by hand
++"""
++
++
++def retrieve_ids(state):
++    return [o for o in state.order if state.is_retrieve(o)]
++
++
++def robustness(state):
++    ids = retrieve_ids(state)
++    return sum(min(state.kappa(o), 2) / 2 for o in ids) / len(ids) if ids else 1.0
++
++
++def conflicts(state):
++    """Variables for which evidence gave more than one distinct value."""
++    vs = {v for oid in state.order for v in state._vars[oid]}
++    return sorted(v for v in vs if len(state.alt_values(v)) > 1)
++
++
++def conflict_rate(state):
++    vs = {v for oid in state.order for v in state._vars[oid] if state.bound(v)}
++    return len(conflicts(state)) / len(vs) if vs else 0.0
++
++
++def risk(state, lam_x=0.5, lam_r=0.5):
++    return (1 - state.coverage()) + lam_x * conflict_rate(state) + lam_r * (1 - robustness(state))
++
++
++def audit(state, lam_x=0.5, lam_r=0.5):
++    return {
++        "C": round(state.coverage(), 3),
++        "R": round(robustness(state), 3),
++        "X": round(conflict_rate(state), 3),
++        "risk": round(risk(state, lam_x, lam_r), 3),
++        "kappa": {o: state.kappa(o) for o in retrieve_ids(state)},
++        "conflicts": conflicts(state),
++    }
+diff --git a/evidence/controller.py b/evidence/controller.py
+new file mode 100644
+index 0000000..c885695
+--- /dev/null
++++ b/evidence/controller.py
+@@ -0,0 +1,31 @@
++"""Layer 3 (v0) - Decision-time controller. Rule-based, no training, no model confidence.
++
++Actions implemented in v0:
++  FillGap   - retrieve for a ready obligation that has no evidence yet
++  Diversify - look for a SECOND independent source for an obligation that has kappa = 1
++Not yet: Bridge, Challenge, Verify (see the plan).
++
++Value of an action = predicted risk reduction - cost  (VNE).  Predicted reduction:
++  FillGap   : C rises by 1/m and R by 0.5/m          -> (1 + 0.5*lam_r) / m
++  Diversify : R rises by 0.5/m                        -> 0.5*lam_r / m
++(m = number of retrieve obligations).  Only actions with VNE > 0 are candidates; when none is
++left the controller stops (the caller then answers if C = 1, otherwise abstains).
++"""
++from evidence.audit import retrieve_ids
++
++
++def plan(state, lam_r=0.5, cost=0.1, diversified=frozenset()):
++    ids = retrieve_ids(state)
++    m = len(ids) or 1
++    acts = []
++    for oid in ids:
++        if not state.covered(oid):
++            if state.ready(oid) and oid not in state.exhausted:
++                gain = (1 + 0.5 * lam_r) / m
++                acts.append({"action": "FillGap", "oid": oid, "gain": gain, "vne": gain - cost})
++        elif state.kappa(oid) == 1 and oid not in diversified:
++            gain = 0.5 * lam_r / m
++            acts.append({"action": "Diversify", "oid": oid, "gain": gain, "vne": gain - cost})
++    acts = [a for a in acts if a["vne"] > 0]
++    acts.sort(key=lambda a: -a["vne"])
++    return acts
+diff --git a/evidence/run_mvp.py b/evidence/run_mvp.py
+index 0f347d9..c2ee505 100644
+--- a/evidence/run_mvp.py
++++ b/evidence/run_mvp.py
+@@ -17,6 +17,8 @@ import urllib.request
+ from openai import AsyncOpenAI
+ 
+ from evidence.obligations import extract_json
++from evidence.audit import audit
++from evidence.controller import plan
+ from evidence.provenance import ProvenanceIndex, clean_hyperedge, norm
+ from evidence.state import EvidenceState
+ 
+@@ -183,10 +185,75 @@ async def answer_question(client, model, state, question):
+     return "", err
+ 
+ 
++ALT_SYSTEM = """You write ONE alternative search query that should retrieve a DIFFERENT source \
++stating the same fact (use synonyms, the full name, or a closely related entity). Do not answer \
++it and do not repeat a previous query.
++Return ONLY JSON: {"query": "..."}"""
++
++
++async def alt_query(client, model, text, used):
++    user = f"Fact to find: {text}\nQueries already used: {json.dumps(used, ensure_ascii=False)}"
++    try:
++        resp = await client.chat.completions.create(
++            model=model, temperature=0,
++            messages=[{"role": "system", "content": ALT_SYSTEM}, {"role": "user", "content": user}],
++            extra_body={"chat_template_kwargs": {"enable_thinking": False}})
++        q = str(extract_json(resp.choices[0].message.content or "").get("query", "")).strip()
++    except Exception:
++        q = ""
++    return q if q and q not in used else ""
++
++
++async def vne_loop(client, args, state, log):
++    """Decision-time controller: re-plan after every action, stop when no action has VNE > 0."""
++    diversified, used = set(), {}
++    for step in range(1, args.max_actions + 1):
++        before = audit(state, args.lam_x, args.lam_r)
++        acts = plan(state, args.lam_r, args.cost, diversified)
++        if not acts:
++            return "vne_stop"
++        a = acts[0]
++        oid = a["oid"]
++        text = state.instantiate(oid)
++        entry = {"round": step, "action": a["action"], "obligation": oid, "vne": round(a["vne"], 3),
++                 "risk_before": before["risk"]}
++        if a["action"] == "FillGap":
++            q = make_query(text)
++        else:
++            diversified.add(oid)          # one attempt per obligation in v0
++            q = await alt_query(client, args.model, text, used.get(oid, []))
++            if not q:
++                entry["note"] = "no alternative query"
++                log.append(entry)
++                continue
++        used.setdefault(oid, []).append(q)
++        res = parse_results(await asyncio.to_thread(retrieve_sync, args.search_url, q))
++        new = state.add_items(res, step, q)
++        k_before = state.kappa(oid)
++        entry.update({"query": q, "returned": len(res), "new": len(new)})
++        if new:
++            targets = list(dict.fromkeys([oid] + [o for o in state.order if state.ready(o) and not state.covered(o)]))
++            good, rejected, items, dbg = await map_passages(client, args.model, state, new, targets)
++            for m, _ in good:
++                state.apply_match(m["obligation"], new[int(m["passage"])], m.get("bindings") or {})
++            entry["matched"] = [(m["obligation"], m.get("bindings")) for m, _ in good]
++            entry["rejected"] = [(m.get("obligation"), why) for m, why in rejected]
++            entry["llm"] = dbg
++        if a["action"] == "FillGap" and not state.covered(oid):
++            state.exhausted.add(oid)       # the same query would return the same passages
++        entry["kappa_gain"] = state.kappa(oid) - k_before
++        entry["risk_after"] = audit(state, args.lam_x, args.lam_r)["risk"]
++        log.append(entry)
++    return "max_actions"
++
++
+ async def solve(client, args, prov, rec):
+     state = EvidenceState(rec["obligations"], prov)
+     log, stop = [], "max_rounds"
+-    for rnd in range(1, args.max_rounds + 1):
++    use_vne = getattr(args, "mode", "fillgap") == "vne"
++    if use_vne:
++        stop = await vne_loop(client, args, state, log)
++    for rnd in (() if use_vne else range(1, args.max_rounds + 1)):
+         targets = [o for o in state.order if state.is_retrieve(o) and not state.covered(o)
+                    and state.ready(o) and o not in state.exhausted]
+         if not targets:
+@@ -214,7 +281,7 @@ async def solve(client, args, prov, rec):
+             entry["passages"] = [(state.items[k].titles, state.items[k].text[:110]) for k in new]
+             log.append(entry)
+     else:
+-        if state.coverage() == 1:
++        if not use_vne and state.coverage() == 1:
+             stop = "all_covered"
+ 
+     vals = state.all_values()
+@@ -233,6 +300,8 @@ async def solve(client, args, prov, rec):
+     em, f1 = em_f1(ans, gold)
+     return {
+         "answer": ans, "answer_error": ans_err, "em": em, "f1": f1, "abstain": abstain, "unmet": unmet,
++        "mode": "vne" if use_vne else "fillgap", "n_retrievals": sum(1 for e in log if e.get("query")),
++        "audit": audit(state, getattr(args, "lam_x", 0.5), getattr(args, "lam_r", 0.5)),
+         "question": rec["question"], "gold": gold, "coverage": state.coverage(), "stop": stop,
+         "bindings": vals, "gold_in_bindings": gold_hit, "log": log,
+         "obligations": [{"id": o, "kind": state.obs[o]["kind"], "text": state.instantiate(o),
+@@ -246,7 +315,10 @@ async def solve(client, args, prov, rec):
+ def show(r):
+     print("\nQ:", r["question"], "| gold:", str(r["gold"])[:50])
+     for e in r["log"]:
+-        print(f"  r{e['round']} {e['obligation']} q='{e['query'][:70]}' returned={e['returned']} new={e['new']}"
++        if "action" in e and "query" not in e:
++            print(f"  r{e['round']} {e['action']} {e['obligation']} vne={e['vne']} {e.get('note', '')}")
++            continue
++        print(f"  r{e['round']} {e.get('action', '')} {e['obligation']} q='{e['query'][:70]}' returned={e['returned']} new={e['new']}"
+               f" matched={e.get('matched', [])} {e.get('note', '')}")
+         if e.get("llm"):
+             print(f"     llm: proposed={e['llm']['proposed']} error={e['llm']['error']}")
+@@ -279,6 +351,12 @@ async def main():
+     ap.add_argument("--api-base", required=True)
+     ap.add_argument("--model", required=True)
+     ap.add_argument("--out", default="trace_mvp.jsonl")
++    ap.add_argument("--mode", choices=["fillgap", "vne"], default="fillgap",
++                    help="fillgap = old loop (baseline); vne = decision-time controller")
++    ap.add_argument("--max-actions", type=int, default=8)
++    ap.add_argument("--lam-x", type=float, default=0.5, help="weight of conflict in Risk")
++    ap.add_argument("--lam-r", type=float, default=0.5, help="weight of weak support in Risk")
++    ap.add_argument("--cost", type=float, default=0.1, help="cost of one retrieval in VNE")
+     ap.add_argument("--verbose", action="store_true")
+     ap.add_argument("--show", action="store_true", help="full per-question trace without raw passages")
+     args = ap.parse_args()
+@@ -329,6 +407,8 @@ async def main():
+     print(f"\n==== {len(rs)} questions | model={args.model}")
+     answered = [r for r in rs if not r.get("abstain")]
+     print(f"EM={avg(rs,'em'):.3f} F1={avg(rs,'f1'):.3f} (abstain counted as wrong) | avg items={sum(r['n_items'] for r in rs)/n:.1f}")
++    print(f"mode={rs[0].get('mode')} | avg retrievals={sum(r.get('n_retrievals', 0) for r in rs)/n:.2f}"
++          f" | avg final risk={sum(r.get('audit', {}).get('risk', 0) for r in rs)/n:.3f}")
+     print(f"answered: {len(answered)}/{len(rs)} | abstained: {len(rs)-len(answered)} | EM on answered only={avg(answered,'em'):.3f}")
+     print(f"fully covered: {len(full)}/{len(rs)}  EM={avg(full,'em'):.3f}  |  not fully covered: {len(part)}  EM={avg(part,'em'):.3f}")
+     print("stop reasons:", dict(__import__("collections").Counter(r["stop"].split(":")[0] for r in rs)))

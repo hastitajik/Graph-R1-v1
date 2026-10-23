@@ -18,6 +18,21 @@ VAR = re.compile(r"\?[A-Za-z]\w*")
 UNKNOWN = "UNKNOWN"
 MIN_QUOTE = 10  # normalized characters
 
+# ---- variable typing (cheap guard against "died in ?P" = 1515) -------------------
+MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+DATE_CUE = re.compile(r"\b(?:born|died|released|published|founded|married|established|premiered|opened)\s+on$"
+                      r"|\bdate of (?:birth|death)\b.*\bis$")
+PLACE_CUE = re.compile(r"\b(?:born|died|buried|located|produced|filmed|based|graduated|educated|studied|raised)\s+(?:in|at|from)$"
+                       r"|\b(?:from|citizen of|native of)$"
+                       r"|\b(?:nationality|country|place of (?:birth|death)|birthplace|city)\b.*\bis$")
+
+
+def date_only(v: str) -> bool:
+    """True if the value is nothing but a date/year (no place or name words)."""
+    s = re.sub(rf"\b{MONTH}\b", " ", v.lower())
+    s = re.sub(r"\b(?:c|ca|circa|ad|bc|bce|ce|th|st|nd|rd|of|the)\b", " ", s)
+    return re.sub(r"[\d\W_]+", "", s) == "" and bool(re.search(r"\d", v))
+
 
 @dataclass
 class Item:
@@ -53,6 +68,30 @@ class EvidenceState:
     def own_vars(self, oid):
         dv = self.dep_vars(oid)
         return [v for v in dict.fromkeys(self._vars[oid]) if v not in dv]
+
+    def owner_of(self, var):
+        """The retrieve obligation that introduces `var` (own var, not inherited from a dependency)."""
+        for oid in self.order:
+            if self.is_retrieve(oid) and var in self.own_vars(oid):
+                return oid
+        return None
+
+    def expected_type(self, oid, var):
+        """'date' / 'place' / None, read from the words just before the variable in the obligation text."""
+        tail = " ".join(self.obs[oid]["text"].split(var)[0].lower().split()[-6:])
+        if DATE_CUE.search(tail):
+            return "date"
+        if PLACE_CUE.search(tail):
+            return "place"
+        return None
+
+    def type_ok(self, oid, var, val):
+        t = self.expected_type(oid, var)
+        if t == "date" and not re.search(r"\d{3,4}", val):
+            return False, f"type mismatch: {var} expects a date, got '{val}'"
+        if t == "place" and date_only(val):
+            return False, f"type mismatch: {var} expects a place, got date '{val}'"
+        return True, ""
 
     # ---- bindings ---------------------------------------------------------
     def _candidates(self, var):
@@ -92,6 +131,20 @@ class EvidenceState:
                 text = text.replace(v, val)
         return text
 
+    def instantiate_open(self, oid):
+        """Obligation text with only the DEPENDENCY variables filled in.
+        Its own variables stay open (?T), so the mapper can always bind them - also for an
+        obligation that is already covered (Diversify looks for a second source of the value)."""
+        text = self.obs[oid]["text"]
+        own = set(self.own_vars(oid))
+        for v in dict.fromkeys(self._vars[oid]):
+            if v in own:
+                continue
+            val = self.value(v)
+            if val is not None:
+                text = re.sub(re.escape(v) + r"(?!\w)", lambda m: val, text)
+        return text
+
     def ready(self, oid):
         return self.is_retrieve(oid) and all(self.bound(v) for v in self._vars[oid] if v in self.dep_vars(oid))
 
@@ -125,6 +178,9 @@ class EvidenceState:
             val = (bindings or {}).get(v)
             if not val or norm(val) not in body:
                 return False, f"binding {v} missing or not in passage"
+            ok, why = self.type_ok(oid, v, val)
+            if not ok:
+                return False, why
         return True, ""
 
     def apply_match(self, oid, item_key, bindings):

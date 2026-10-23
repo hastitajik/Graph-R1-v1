@@ -1,0 +1,38 @@
+diff --git a/evidence/run_mvp.py b/evidence/run_mvp.py
+index c2ee505..edeb820 100644
+--- a/evidence/run_mvp.py
++++ b/evidence/run_mvp.py
+@@ -87,7 +87,7 @@ def retrieve_sync(url, query, timeout=180):
+ async def map_passages(client, model, state, new_keys, ready_oids):
+     """One LLM call: which new passages support which ready obligations. Returns validated matches."""
+     items = [state.items[k] for k in new_keys]
+-    obs = "\n".join(f"{oid}: {state.instantiate(oid)}" for oid in ready_oids)
++    obs = "\n".join(f"{oid}: {state.instantiate_open(oid)}" for oid in ready_oids)
+     pas = "\n".join(f"[{i}] (article: {', '.join(it.titles) or 'unknown'}) {it.text[:PASSAGE_CHARS]}"
+                     for i, it in enumerate(items))
+     user = f"Obligations:\n{obs}\n\nPassages:\n{pas}"
+diff --git a/evidence/state.py b/evidence/state.py
+index 85439e0..0b714e3 100644
+--- a/evidence/state.py
++++ b/evidence/state.py
+@@ -131,6 +131,20 @@ class EvidenceState:
+                 text = text.replace(v, val)
+         return text
+ 
++    def instantiate_open(self, oid):
++        """Obligation text with only the DEPENDENCY variables filled in.
++        Its own variables stay open (?T), so the mapper can always bind them - also for an
++        obligation that is already covered (Diversify looks for a second source of the value)."""
++        text = self.obs[oid]["text"]
++        own = set(self.own_vars(oid))
++        for v in dict.fromkeys(self._vars[oid]):
++            if v in own:
++                continue
++            val = self.value(v)
++            if val is not None:
++                text = re.sub(re.escape(v) + r"(?!\w)", lambda m: val, text)
++        return text
++
+     def ready(self, oid):
+         return self.is_retrieve(oid) and all(self.bound(v) for v in self._vars[oid] if v in self.dep_vars(oid))
+ 
