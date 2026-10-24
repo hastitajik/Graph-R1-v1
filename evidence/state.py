@@ -8,6 +8,12 @@ bindings (?D = "Wojciech Jerzy Has").
 Provenance unit of an item = its Wikipedia article title(s) (see provenance.py).
 Items with unknown title all collapse into ONE "UNKNOWN" unit: they count for Coverage
 but are never counted as independent support.
+
+"Live" support (what audit.py and the controller reason about): a support entry counts only if
+  1. its unit is not dropped (counterfactual removal of one source),
+  2. it was matched under the CURRENT value of every variable the obligation inherits
+     (otherwise the hop's evidence talks about a different entity than the chain now uses), and
+  3. it agrees with the chosen value of the obligation's own variables.
 """
 from dataclasses import dataclass
 
@@ -16,6 +22,7 @@ from evidence.provenance import norm
 
 UNKNOWN = "UNKNOWN"
 MIN_QUOTE = 10  # normalized characters
+NO_DROP = frozenset()
 
 
 @dataclass
@@ -36,8 +43,11 @@ class EvidenceState:
         self.answer_id = obligations["answer_id"]
         self.items = {}                              # item key -> Item
         self.support = {oid: {} for oid in self.obs}  # oid -> {item key: {var: value}}
+        self.context = {}                            # (oid, item key) -> inherited values at match time
+        self.verified = {}                           # (oid, item key) -> True / False (Verify action)
+        self.queries = {oid: [] for oid in self.obs}  # oid -> queries already sent (as written)
         self.exhausted = set()                       # oids whose query returned nothing new
-        self.checked = set()                         # (item key, oid) pairs already shown to the matcher
+        self.checked = set()                         # (item key, oid, inherited values) already shown to the matcher
         self._vars = {oid: VAR.findall(o["text"]) for oid, o in self.obs.items()}
 
     # ---- structure -------------------------------------------------------
@@ -54,51 +64,96 @@ class EvidenceState:
         dv = self.dep_vars(oid)
         return [v for v in dict.fromkeys(self._vars[oid]) if v not in dv]
 
+    def required_ids(self):
+        """The answer obligation and everything it depends on (transitively)."""
+        seen, stack = set(), [self.answer_id]
+        while stack:
+            o = stack.pop()
+            if o in seen:
+                continue
+            seen.add(o)
+            stack.extend(self.obs[o]["depends_on"])
+        return seen
+
+    def descendants(self, oid):
+        """Obligations that depend on `oid`, directly or not."""
+        out, frontier = set(), {oid}
+        while frontier:
+            nxt = {o for o in self.order if set(self.obs[o]["depends_on"]) & frontier} - out
+            out |= nxt
+            frontier = nxt
+        return out
+
     # ---- bindings ---------------------------------------------------------
-    def _candidates(self, var):
-        """normalized value -> {"value": str, "items": set(item keys)}"""
+    def dep_context(self, oid, drop=NO_DROP):
+        """Current (normalized) values of the variables `oid` inherits from its dependencies."""
+        out = {}
+        for v in sorted(self.dep_vars(oid)):
+            val = self.value(v, drop)
+            if val is not None:
+                out[v] = norm(val)
+        return out
+
+    def _candidates(self, var, drop=NO_DROP):
+        """normalized value -> {"value": str, "items": set(item keys)}; stale / dropped support is ignored."""
         cands = {}
-        for sup in self.support.values():
+        for oid, sup in self.support.items():
+            ctx = None  # computed lazily: only the obligation that owns `var` is ever asked
             for key, b in sup.items():
-                if var in b and b[var]:
-                    c = cands.setdefault(norm(b[var]), {"value": b[var], "items": set()})
-                    c["items"].add(key)
+                if var not in b or not b[var] or self.unit(self.items[key]) in drop:
+                    continue
+                if ctx is None:
+                    ctx = self.dep_context(oid, drop)
+                if self.context.get((oid, key), {}) != ctx:
+                    continue
+                c = cands.setdefault(norm(b[var]), {"value": b[var], "items": set()})
+                c["items"].add(key)
         return cands
 
-    def value(self, var):
-        """Best-supported value of a variable (most independent units, then coherence)."""
-        cands = self._candidates(var)
-        if not cands:
-            return None
-
-        def score(c):
+    def ranked_values(self, var, drop=NO_DROP):
+        """[(value, units, item keys)], best first. Rank = independent units, coherence, #items."""
+        rows = []
+        for c in self._candidates(var, drop).values():
             units = {self.unit(self.items[k]) for k in c["items"]}
-            return (len(units), max(self.items[k].coherence for k in c["items"]), len(c["items"]))
+            coh = max(self.items[k].coherence for k in c["items"])
+            rows.append(((len(units), coh, len(c["items"])), c["value"], units, c["items"]))
+        rows.sort(key=lambda r: r[0], reverse=True)
+        return [(v, u, i) for _, v, u, i in rows]
 
-        return max(cands.values(), key=score)["value"]
+    def value(self, var, drop=NO_DROP):
+        """Best-supported value of a variable (most independent units, then coherence)."""
+        r = self.ranked_values(var, drop)
+        return r[0][0] if r else None
 
     def alt_values(self, var):
         """All distinct values seen for a variable (more than one = potential conflict)."""
         return [c["value"] for c in self._candidates(var).values()]
 
     def conflicts(self):
-        """{var: [values]} for variables that have more than one distinct supported value.
-
-        Not used for decisions yet (the controller will read it); it is reported in the trace.
-        """
+        """{var: [values]} for variables that have more than one distinct supported value."""
         every = {v for oid in self.order for v in self._vars[oid]}
         return {v: self.alt_values(v) for v in sorted(every) if len(self._candidates(v)) > 1}
 
     def bound(self, var):
         return self.value(var) is not None
 
-    def instantiate(self, oid):
-        text = self.obs[oid]["text"]
-        for v in dict.fromkeys(self._vars[oid]):
+    def instantiate(self, oid, keep_own=False):
+        """Obligation text with known variables replaced by their value.
+
+        keep_own=True leaves the obligation's OWN variables as ?X even when they are bound, which is
+        what the matcher needs to find a second source or a contradicting value for a fact we
+        already hold (instantiated, the text would only match the value we already have).
+        """
+        skip = set(self.own_vars(oid)) if keep_own else set()
+
+        def sub(m):
+            v = m.group(0)
+            if v in skip:
+                return v
             val = self.value(v)
-            if val is not None:
-                text = text.replace(v, val)
-        return text
+            return v if val is None else val
+
+        return VAR.sub(sub, self.obs[oid]["text"])
 
     def ready(self, oid):
         return self.is_retrieve(oid) and all(self.bound(v) for v in self._vars[oid] if v in self.dep_vars(oid))
@@ -138,6 +193,20 @@ class EvidenceState:
     def apply_match(self, oid, item_key, bindings):
         own = self.own_vars(oid)
         self.support[oid][item_key] = {v: bindings[v] for v in own if bindings.get(v)}
+        self.context[(oid, item_key)] = self.dep_context(oid)
+
+    def remove_support(self, oid, item_key):
+        """Drop a support entry that Verify found unsupported by its own passage."""
+        self.support[oid].pop(item_key, None)
+        self.context.pop((oid, item_key), None)
+        self.verified[(oid, item_key)] = False
+
+    def note_query(self, oid, query):
+        self.queries[oid].append(query)
+
+    def tried(self, oid):
+        """Normalized queries already sent for this obligation."""
+        return {norm(q) for q in self.queries[oid]}
 
     # ---- bookkeeping of what the matcher has already seen -------------------------
     def unchecked(self, oid):
@@ -148,22 +217,48 @@ class EvidenceState:
         the item arrived, so the matcher never looked at the pair. Once the obligation is
         ready these items must be checked before spending a new query on it.
         """
-        return [k for k in self.items if (k, oid) not in self.checked]
+        sig = self._sig(oid)
+        return [k for k in self.items if (k, oid, sig) not in self.checked]
 
     def mark_checked(self, keys, oids):
-        self.checked.update((k, o) for k in keys for o in oids)
+        for o in oids:
+            sig = self._sig(o)
+            self.checked.update((k, o, sig) for k in keys)
 
-    # ---- metrics (Layer 3 will extend) ---------------------------------------
+    def _sig(self, oid):
+        """Values of the inherited variables. If they change (a hop was re-resolved), the pairs
+        checked under the old values are no longer valid and must be shown to the matcher again."""
+        return tuple(sorted(self.dep_context(oid).items()))
+
+    # ---- live support and metrics ---------------------------------------------------
+    def live_support(self, oid, drop=NO_DROP):
+        """Item keys that currently support `oid` (see module docstring), best coherence first."""
+        own = self.own_vars(oid)
+        chosen = {v: self.value(v, drop) for v in own}
+        ctx = self.dep_context(oid, drop)
+        out = []
+        for key, b in self.support[oid].items():
+            if self.unit(self.items[key]) in drop or self.context.get((oid, key), {}) != ctx:
+                continue
+            if any(chosen[v] is None or norm(b.get(v, "")) != norm(chosen[v]) for v in own):
+                continue
+            out.append(key)
+        return sorted(out, key=lambda k: -self.items[k].coherence)
+
     def covered(self, oid):
-        return bool(self.support[oid])
+        return bool(self.live_support(oid))
 
     def coverage(self):
         r = [o for o in self.order if self.is_retrieve(o)]
         return sum(self.covered(o) for o in r) / len(r) if r else 1.0
 
     def kappa(self, oid):
-        """Number of distinct provenance units supporting an obligation (UNKNOWN counts once)."""
-        return len({self.unit(self.items[k]) for k in self.support[oid]})
+        """Distinct provenance units behind the chosen value of an obligation (UNKNOWN counts once)."""
+        return len({self.unit(self.items[k]) for k in self.live_support(oid)})
+
+    def kappa_known(self, oid):
+        """Like kappa, but only units with a known article title (UNKNOWN is never independent)."""
+        return len({self.unit(self.items[k]) for k in self.live_support(oid)} - {UNKNOWN})
 
     def all_values(self):
         vs = {v for oid in self.order for v in self._vars[oid]}
