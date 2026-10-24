@@ -97,10 +97,14 @@ def retrieve_sync(url, query, timeout=180, retries=3):
     raise last
 
 
-async def map_passages(client, model, state, new_keys, ready_oids):
-    """One LLM call: which passages support which ready obligations. Returns validated matches."""
+async def map_passages(client, model, state, new_keys, ready_oids, texts=None):
+    """One LLM call: which passages support which ready obligations. Returns validated matches.
+
+    texts: optional {oid: text} that replaces state.instantiate(oid) in the prompt (the controller
+    passes state.instantiate(oid, keep_own=True) to look for other values of a fact it already holds).
+    """
     items = [state.items[k] for k in new_keys]
-    obs = "\n".join(f"{oid}: {state.instantiate(oid)}" for oid in ready_oids)
+    obs = "\n".join(f"{oid}: {(texts or {}).get(oid) or state.instantiate(oid)}" for oid in ready_oids)
     pas = "\n".join(f"[{i}] {it.text[:PASSAGE_CHARS]}" for i, it in enumerate(items))
     user = f"Obligations:\n{obs}\n\nPassages:\n{pas}"
     raw = None
@@ -132,7 +136,7 @@ async def map_passages(client, model, state, new_keys, ready_oids):
     return good, rejected, items, dbg
 
 
-async def map_and_apply(client, model, state, keys, oids):
+async def map_and_apply(client, model, state, keys, oids, texts=None):
     """Show the items `keys` to the matcher against obligations `oids` and apply the validated matches.
 
     Returns (matched, rejected, dbg) for the trace. A pair is marked as checked only when the
@@ -141,7 +145,7 @@ async def map_and_apply(client, model, state, keys, oids):
     matched, rejected, dbgs = [], [], []
     for i in range(0, len(keys), MAP_BATCH):
         batch = keys[i:i + MAP_BATCH]
-        good, rej, _, dbg = await map_passages(client, model, state, batch, oids)
+        good, rej, _, dbg = await map_passages(client, model, state, batch, oids, texts)
         for m, _ in good:
             state.apply_match(m["obligation"], batch[int(m["passage"])], m.get("bindings") or {})
         if not dbg["error"]:
@@ -168,7 +172,7 @@ async def answer_question(client, model, state, question):
     for oid in state.order:
         text = state.instantiate(oid)
         if state.is_retrieve(oid) and state.covered(oid):
-            best = max((state.items[k] for k in state.support[oid]), key=lambda it: it.coherence)
+            best = state.items[state.live_support(oid)[0]]  # live_support is sorted by coherence
             lines.append(f"- {text}\n  evidence: {best.text[:300]}")
         elif state.is_retrieve(oid):
             lines.append(f"- {text}  (NOT FOUND)")
@@ -217,6 +221,7 @@ async def solve(client, args, prov, rec):
             # (b) a new query
             q = make_query(state.instantiate(oid))
             res = parse_results(await asyncio.to_thread(retrieve_sync, args.search_url, q))
+            state.note_query(oid, q)
             new = state.add_items(res, rnd, q)
             entry = {"round": rnd, "obligation": oid, "phase": "query", "query": q,
                      "returned": len(res), "new": len(new)}
