@@ -129,7 +129,15 @@ async def map_passages(client, model, state, new_keys, ready_oids, texts=None):
     for m in (raw or {}).get("matches", []):
         try:
             item = items[int(m["passage"])]
-            ok, why = state.validate_match(m["obligation"], item, m.get("bindings") or {}, m.get("quote", ""))
+            b = m.get("bindings") or {}
+            # the model often writes the wrong obligation id: the variable decides who owns the match
+            owners = {state.owner_of(v) for v in b} - {None}
+            if len(owners) == 1:
+                m["obligation"] = next(iter(owners))
+            if m["obligation"] not in ready_oids:
+                ok, why = False, f"{m['obligation']} was not requested"
+            else:
+                ok, why = state.validate_match(m["obligation"], item, b, m.get("quote", ""))
         except Exception as e:
             ok, why = False, f"bad match: {e}"
         (good if ok else rejected).append((m, why))
