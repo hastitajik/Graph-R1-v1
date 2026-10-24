@@ -15,6 +15,8 @@ but are never counted as independent support.
      (otherwise the hop's evidence talks about a different entity than the chain now uses), and
   3. it agrees with the chosen value of the obligation's own variables.
 """
+import os
+import re
 from dataclasses import dataclass
 
 from evidence.common import VAR  # noqa: F401  (re-exported for callers that import it from here)
@@ -23,6 +25,42 @@ from evidence.provenance import norm
 UNKNOWN = "UNKNOWN"
 MIN_QUOTE = 10  # normalized characters
 NO_DROP = frozenset()
+SUBJECT_CHECK = os.environ.get("EVIDENCE_SUBJECT_CHECK", "1") != "0"
+
+# ---- cheap guards against wrong bindings (found in real traces) ---------------------------------
+MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+_DATE_CUE = re.compile(r"\b(?:born|died|released|published|founded|married|established|premiered|opened)\s+on$"
+                       r"|\bdate of (?:birth|death)\b.*\bis$")
+_PLACE_CUE = re.compile(r"\b(?:born|died|buried|located|produced|filmed|based|graduated|educated|studied|raised)\s+(?:in|at|from)$"
+                        r"|\b(?:from|citizen of|native of)$"
+                        r"|\b(?:nationality|country|place of (?:birth|death)|birthplace|city)\b.*\bis$")
+
+
+def date_only(v: str) -> bool:
+    """True if the value is nothing but a date or a year (no place / name words)."""
+    s = re.sub(rf"\b{MONTH}\b", " ", v.lower())
+    s = re.sub(r"\b(?:c|ca|circa|ad|bc|bce|ce|th|st|nd|rd|of|the)\b", " ", s)
+    return re.sub(r"[\d\W_]+", "", s) == "" and bool(re.search(r"\d", v))
+
+
+def _tokens(s: str) -> set:
+    return {w for w in re.findall(r"\w+", s.lower()) if len(w) >= 3}
+
+
+def _title_core(t: str) -> str:
+    return re.sub(r"\s*\([^)]*\)\s*$", "", t)
+
+
+def subject_in(value: str, titles, passage: str) -> bool:
+    """Is the entity `value` what this passage is about? (its text, its article title, or >= half of its words)"""
+    if norm(value) in norm(passage):
+        return True
+    for t in titles or []:
+        tn = norm(_title_core(t))
+        if tn and (tn in norm(value) or norm(value) in tn):
+            return True
+    vt = _tokens(value)
+    return not vt or len(vt & _tokens(" ".join(titles or []) + " " + passage)) / len(vt) >= 0.5
 
 
 @dataclass
@@ -63,6 +101,30 @@ class EvidenceState:
     def own_vars(self, oid):
         dv = self.dep_vars(oid)
         return [v for v in dict.fromkeys(self._vars[oid]) if v not in dv]
+
+    def owner_of(self, var):
+        """The retrieve obligation that introduces `var` (own variable, not inherited)."""
+        for oid in self.order:
+            if self.is_retrieve(oid) and var in self.own_vars(oid):
+                return oid
+        return None
+
+    def expected_type(self, oid, var):
+        """'date' / 'place' / None, read from the words just before the variable in the obligation text."""
+        tail = " ".join(self.obs[oid]["text"].split(var)[0].lower().split()[-6:])
+        if _DATE_CUE.search(tail):
+            return "date"
+        if _PLACE_CUE.search(tail):
+            return "place"
+        return None
+
+    def type_ok(self, oid, var, val):
+        t = self.expected_type(oid, var)
+        if t == "date" and not re.search(r"\d{3,4}", val):
+            return False, f"type mismatch: {var} expects a date, got '{val}'"
+        if t == "place" and date_only(val):
+            return False, f"type mismatch: {var} expects a place, got date '{val}'"
+        return True, ""
 
     def required_ids(self):
         """The answer obligation and everything it depends on (transitively)."""
@@ -188,6 +250,14 @@ class EvidenceState:
             val = (bindings or {}).get(v)
             if not val or norm(val) not in body:
                 return False, f"binding {v} missing or not in passage"
+            ok, why = self.type_ok(oid, v, val)
+            if not ok:
+                return False, why
+        if SUBJECT_CHECK:  # the passage must be about the entity the chain arrived at
+            for v in sorted(self.dep_vars(oid)):
+                ent = self.value(v)
+                if ent and v in self.obs[oid]["text"] and not subject_in(ent, item.titles, item.text):
+                    return False, f"subject mismatch: passage is not about {ent}"
         return True, ""
 
     def apply_match(self, oid, item_key, bindings):

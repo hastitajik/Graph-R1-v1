@@ -357,7 +357,9 @@ class Episode:
             rec["new"] = len(new_keys)
             if new_keys:
                 texts = {a.oid: S.instantiate(a.oid, keep_own=True)} if a.kind in ("Diversify", "Challenge") else None
-                ready = [o for o in S.order if S.ready(o)]
+                # Diversify / Challenge look for another value of THEIR obligation only; letting them
+                # cover a different obligation as a side effect produced wrong evidence
+                ready = [a.oid] if texts else [o for o in S.order if S.ready(o)]
                 matched, rejected, dbg = await self.match(new_keys, ready, texts)
                 rec["matched"], rec["rejected"], rec["llm_error"] = matched, rejected, dbg["error"]
             # novelty bookkeeping (over-retrieval)
