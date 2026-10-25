@@ -16,6 +16,7 @@ from openai import AsyncOpenAI
 
 from evidence.common import LLM_BASE_URL, LLM_MODEL, SEARCH_URL
 from evidence.metrics import em_f1
+from evidence.provenance import norm
 from evidence.run_mvp import parse_results, retrieve_sync
 
 INSTR = """Answer the given question. You can query from knowledge base provided to you to answer the question. You can query knowledge as many times as you want.
@@ -50,7 +51,7 @@ async def gen(client, args, msgs, stop):
 
 async def run_one(client, args, rec):
     msgs = [{"role": "user", "content": INSTR + "Question: " + rec["question"] + (SHORT if args.short else "")}]
-    searches, turns, answer, err, trail = 0, 0, "", None, []
+    searches, turns, answer, err, trail, seen = 0, 0, "", None, [], []
     try:
         for _ in range(args.max_turns):
             turns += 1
@@ -69,6 +70,7 @@ async def run_one(client, args, rec):
             except Exception as e:
                 info = f"[search error: {e}]"
             searches += 1
+            seen.append(info)
             msgs += [{"role": "assistant", "content": out + "</query>"},
                      {"role": "user", "content": f"<information>\n{info[:args.info_chars]}\n</information>"}]
         if not answer:  # forced final answer after the turn budget
@@ -81,7 +83,10 @@ async def run_one(client, args, rec):
         err = f"{type(e).__name__}: {e}"[:200]
     gold = rec.get("gold") or []
     em, f1 = em_f1(answer, gold)
-    return {"question": rec["question"], "gold": gold, "answer": answer, "em": em, "f1": f1,
+    a = norm(answer)
+    # heuristic: the answer string occurs in what was retrieved (yes/no answers cannot be checked this way)
+    grounded = bool(a) and a in norm(" ".join(seen))
+    return {"question": rec["question"], "gold": gold, "answer": answer, "em": em, "f1": f1, "grounded": grounded,
             "searches": searches, "turns": turns, "error": err, "trail": trail}
 
 
@@ -124,6 +129,10 @@ async def main():
     print(f"\n==== BASELINE {n} questions | model={args.model}")
     print(f"EM={sum(r['em'] for r in rs)/n:.3f} F1={sum(r['f1'] for r in rs)/n:.3f} | "
           f"avg searches={sum(r['searches'] for r in rs)/n:.1f} avg turns={sum(r['turns'] for r in rs)/n:.1f}")
+    g = [r for r in rs if r["grounded"]]
+    u = [r for r in rs if not r["grounded"]]
+    print(f"answer string found in retrieved text: {len(g)}/{n} EM={sum(r['em'] for r in g)/max(len(g),1):.3f} | "
+          f"not found (yes/no, derived or from the model's own memory): {len(u)} EM={sum(r['em'] for r in u)/max(len(u),1):.3f}")
     print(f"no answer: {sum(1 for r in rs if not r['answer'])} | errors: {sum(1 for r in rs if r['error'])}")
 
 
