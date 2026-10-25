@@ -25,6 +25,9 @@ from evidence.provenance import norm
 UNKNOWN = "UNKNOWN"
 MIN_QUOTE = 10  # normalized characters
 NO_DROP = frozenset()
+# "article": the independence unit is the Wikipedia article title (provenance-aware, default);
+# "passage": every retrieved passage counts as independent (naive baseline for the provenance ablation)
+UNIT_MODE = os.environ.get("EVIDENCE_UNIT", "article")
 SELF_CHECK = os.environ.get("EVIDENCE_SELF_CHECK", "1") != "0"
 SUBJECT_CHECK = os.environ.get("EVIDENCE_SUBJECT_CHECK", "1") != "0"
 
@@ -260,6 +263,8 @@ class EvidenceState:
     # ---- evidence ----------------------------------------------------------
     @staticmethod
     def unit(item: Item):
+        if UNIT_MODE == "passage":
+            return item.key
         return "|".join(item.titles) if item.titles else UNKNOWN
 
     def add_items(self, results, rnd, query):

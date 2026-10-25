@@ -87,6 +87,10 @@ class Weights:
     risk_mode: str = "pareto"  # "pareto": a step must not worsen any component; "scalar": Risk(s) must drop
     lam_x: float = 0.5         # weight of unresolved conflicts in the scalar risk
     lam_r: float = 0.5         # weight of (1 - robustness) in the scalar risk
+    alpha: float = 0.5         # step reward r = dC + alpha dR + beta dD - gamma dX - lam_cost * cost
+    beta: float = 0.5
+    gamma: float = 0.5
+    lam_cost: float = 1.0
     learn_p: bool = False     # carry the success counts of each action kind over to the next questions
     disabled: tuple = ()      # action kinds switched off (ablations)
     seen: dict = field(default_factory=lambda: {})  # kind -> [successes, attempts] over all questions
@@ -393,6 +397,8 @@ class Episode:
         g[1] += 1
         g[0] += int(improved)
         rec["improved"] = improved
+        d = [x - y for x, y in zip(after.vector, before)]   # (dC, dR, dD, -dX)
+        rec["reward"] = round(d[0] + W.alpha * d[1] + W.beta * d[2] + W.gamma * d[3] - W.lam_cost * a.cost, 4)
         rec["vector"] = [round(x, 3) for x in after.vector]
         if a.kind != "Verify":
             self.stall = 0 if (improved or new_keys) else self.stall + 1
@@ -536,6 +542,14 @@ def summary(rs, model):
             succ[k] += v["success"]
     print("actions (success/attempts):", {k: f"{succ[k]}/{acts[k]}" for k in acts})
     print("questions flagged by the monitor:", dict(sum((Counter(r["pathologies"]) for r in rs), Counter())))
+    rew = {}
+    for r in rs:
+        for s in r["steps"]:
+            if "reward" in s:
+                rew.setdefault(s["action"], []).append(s["reward"])
+    if rew:
+        print("mean step reward (dC + a dR + b dD - g dX - lam cost):",
+              {k: round(sum(v) / len(v), 3) for k, v in rew.items()})
     ver = Counter(s["verify"] for r in rs for s in r["steps"] if "verify" in s)
     if ver:
         print("Verify outcomes:", dict(ver), "(rejected = support removed; check these by hand for false rejections)")
@@ -571,6 +585,10 @@ async def main():
                     help="how a step is judged: Pareto vector (default) or the scalar Risk of the plan")
     ap.add_argument("--lam-x", type=float, default=0.5, help="scalar risk: weight of unresolved conflicts")
     ap.add_argument("--lam-r", type=float, default=0.5, help="scalar risk: weight of (1 - robustness)")
+    ap.add_argument("--unit", choices=("article", "passage"), default="article",
+                    help="independence unit: Wikipedia article (provenance-aware) or every passage (naive ablation)")
+    for f in ("alpha", "beta", "gamma", "lam_cost"):
+        ap.add_argument(f"--r-{f.replace('_', '-')}", type=float, default=getattr(d, f), help="step reward weight")
     ap.add_argument("--out", default="trace_ctrl.jsonl")
     ap.add_argument("--show", action="store_true")
     for f in ("gap", "conflict", "challenge", "fragile", "unverified", "c_search", "c_llm", "prior_succ", "prior_att"):
@@ -580,7 +598,10 @@ async def main():
     args = ap.parse_args()
     if not args.search_url:
         ap.error("--search-url (or EVIDENCE_SEARCH_URL) is required")
-    W = replace(d, learn_p=args.learn_p, risk_mode=args.risk_mode, lam_x=args.lam_x, lam_r=args.lam_r, disabled=tuple(k for k in args.disable.split(",") if k),
+    import evidence.state as state_mod
+    state_mod.UNIT_MODE = args.unit
+    W = replace(d, alpha=args.r_alpha, beta=args.r_beta, gamma=args.r_gamma, lam_cost=args.r_lam_cost,
+                learn_p=args.learn_p, risk_mode=args.risk_mode, lam_x=args.lam_x, lam_r=args.lam_r, disabled=tuple(k for k in args.disable.split(",") if k),
                 **{f: getattr(args, f"w_{f}") for f in ("gap", "conflict", "challenge", "fragile", "unverified",
                                                           "c_search", "c_llm", "prior_succ", "prior_att")},
                 **{f: getattr(args, f) for f in ("stall_limit", "novelty_limit", "max_queries")})
