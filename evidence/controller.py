@@ -56,6 +56,7 @@ from openai import AsyncOpenAI
 
 from evidence.audit import audit, pareto_improves, required_retrieve
 from evidence.common import LLM_BASE_URL, LLM_MODEL, SEARCH_URL
+from evidence.derive import derive_answer
 from evidence.metrics import em_f1
 from evidence.obligations import extract_json
 from evidence.provenance import ProvenanceIndex, norm
@@ -202,10 +203,9 @@ class Episode:
 
     # ---- probabilities, costs
     def p(self, kind):
-        s, a = self.stats[kind]
-        if self.W.learn_p:
-            gs, ga = self.W.seen.get(kind, (0, 0))
-            s, a = s + gs, a + ga
+        # with learn_p the run-wide counter W.seen already contains the attempts of THIS question
+        # (execute() updates both), so it replaces the per-question counter instead of being added to it
+        s, a = self.W.seen.get(kind, (0, 0)) if self.W.learn_p else self.stats[kind]
         return (s + self.W.prior_succ) / (a + self.W.prior_att)
 
     def price(self, a: Action):
@@ -238,12 +238,9 @@ class Episode:
         if covered and not cert.uncovered and cert.d_prov == 0 and not self.challenged:
             weakest = min(covered, key=lambda o: min(S.items[k].coherence for k in S.live_support(o)))
             flags["confirmation_bias"] = [weakest]
-        for k in ("retrieval_loop",):
+        for k in ("retrieval_loop", "over_retrieval", "confirmation_bias"):
             if flags[k]:
-                self.flags_seen[k] += 1
-        for k in ("over_retrieval", "confirmation_bias"):
-            if flags[k]:
-                self.flags_seen[k] += 1
+                self.flags_seen[k] = 1   # a question is flagged once, however many steps it stays true
         return flags
 
     # ---- proposal
@@ -446,14 +443,24 @@ async def solve(client, args, prov, rec, W=None):
     else:
         ans, ans_err = await answer_question(client, args.model, state, rec["question"])
         ep.n_llm += 1
+    ans_llm, derived = ans, None
+    if ans and getattr(args, "det_compare", True):
+        # the last step of a date comparison needs no LLM: compute it from the certified values
+        derived = derive_answer(state, rec["question"])
+        if derived:
+            ans = derived["answer"]
     em, f1 = em_f1(ans, gold)
     grounded, why = answer_grounded(state, ans)
     certified = cert.complete and (grounded or abstained)
     cert_d = cert.to_dict()
     if cert.complete and not certified:
         cert_d["reasons"] = list(cert_d.get("reasons", [])) + [why]
+        if stop == "certified":
+            stop = "ungrounded"   # the audit passed but the answer is not backed by it: do not call it certified
 
     pathologies = {k: v for k, v in ep.flags_seen.items()}
+    if derived and norm(ans_llm) != norm(derived["answer"]):
+        pathologies["derive_mismatch"] = 1   # the LLM's comparison disagreed with the computed one
     if uncovered and ans:
         pathologies["premature_confidence"] = 1
     if ans and state.obs[state.answer_id]["kind"] == "retrieve":
@@ -463,7 +470,7 @@ async def solve(client, args, prov, rec, W=None):
 
     vals = state.all_values()
     return {
-        "answer": ans, "answer_error": ans_err, "em": em, "f1": f1,
+        "answer": ans, "answer_llm": ans_llm, "derived": derived, "answer_error": ans_err, "em": em, "f1": f1,
         "question": rec["question"], "gold": gold, "coverage": cert.coverage, "stop": stop,
         "certified": certified, "certificate": cert_d, "abstained": abstained,
         "answered_from_incomplete": bool(uncovered) and not abstained,
@@ -515,7 +522,14 @@ def summary(rs, model):
             acts[k] += v["attempts"]
             succ[k] += v["success"]
     print("actions (success/attempts):", {k: f"{succ[k]}/{acts[k]}" for k in acts})
-    print("pathologies:", dict(sum((Counter(r["pathologies"]) for r in rs), Counter())))
+    print("questions flagged by the monitor:", dict(sum((Counter(r["pathologies"]) for r in rs), Counter())))
+    ver = Counter(s["verify"] for r in rs for s in r["steps"] if "verify" in s)
+    if ver:
+        print("Verify outcomes:", dict(ver), "(rejected = support removed; check these by hand for false rejections)")
+    dm = [r for r in rs if r.get("derived")]
+    if dm:
+        bad = [r for r in dm if r["pathologies"].get("derive_mismatch")]
+        print(f"computed date comparisons: {len(dm)} | the LLM's own comparison differed in {len(bad)}")
     errs = sum(1 for r in rs for s in r["steps"] if s.get("llm_error") or s.get("errors")) + sum(1 for r in rs if r.get("answer_error"))
     if errs:
         print(f"!! {errs} LLM/search call(s) failed - check these results before using them")
@@ -535,6 +549,8 @@ async def main():
     ap.add_argument("--model", default=LLM_MODEL, help="LLM name (or EVIDENCE_LLM_MODEL)")
     ap.add_argument("--abstain-uncertified", action="store_true",
                     help="empty answer when the certificate is not complete (default: answer anyway, flagged)")
+    ap.add_argument("--no-det-compare", dest="det_compare", action="store_false",
+                    help="let the LLM answer date-comparison questions (default: compute them from the certified dates)")
     ap.add_argument("--learn-p", action="store_true",
                     help="keep per-action success counts across questions (use with --concurrency 1)")
     ap.add_argument("--disable", default="", help="comma list of action kinds to switch off, e.g. Diversify,Verify")
