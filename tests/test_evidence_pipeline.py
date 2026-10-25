@@ -47,6 +47,41 @@ class Compare(unittest.TestCase):
         self.assertIn("| 0 | 1c | 1 |", text)
 
 
+class PlanConformance(unittest.TestCase):
+    def test_naive_provenance_counts_every_passage_as_independent(self):
+        import evidence.state as S
+        from tests.test_evidence_guards import hold, mk
+        st = mk([{"id": "o1", "text": "The director of F is ?D", "depends_on": [], "kind": "retrieve"}], "o1")
+        for k in ("a", "b"):
+            hold(st, k, "Same Article", "Anna Berg directed F", "o1", {"?D": "Anna Berg"})
+        try:
+            S.UNIT_MODE = "article"
+            self.assertEqual(st.kappa("o1"), 1)       # two passages of one article: one unit
+            S.UNIT_MODE = "passage"
+            self.assertEqual(st.kappa("o1"), 2)       # naive: independent
+        finally:
+            S.UNIT_MODE = "article"
+
+    def test_every_executed_step_records_the_plan_reward(self):
+        import asyncio
+        from evidence.audit import audit
+        from tests.test_evidence_guards import FakeClient, hold, mk
+        st = mk([{"id": "o1", "text": "The director of F is ?D", "depends_on": [], "kind": "retrieve"}], "o1")
+        quote = "Anna Berg directed the film F"
+        hold(st, "a", "F", quote, "o1", {"?D": "Anna Berg"})
+        client = FakeClient([])
+        client.reply = '{"supported": true, "quote": "%s"}' % quote
+        args = types.SimpleNamespace(model="m", search_url="x", max_searches=10, max_steps=5)
+        e = C.Episode(st, "q", client, args, C.Weights())
+        act = e.price(C.Action("Verify", "o1", [], None, 0.15, "single point of failure"))
+        cert = audit(st)
+        asyncio.run(e.execute(act, 1, cert))
+        rec = e.steps[0]
+        self.assertEqual(rec["verify"], "supported")
+        # robustness 0 -> 1 (+0.5 * 1), cost 0.02 (one LLM call): r = 0.5 - 0.02
+        self.assertAlmostEqual(rec["reward"], 0.48, places=3)
+
+
 class Pipeline(unittest.TestCase):
     def test_module_imports_and_parses(self):
         import evidence.pipeline as P

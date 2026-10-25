@@ -74,6 +74,28 @@ and uncertified answers, and the selective EM (answer only when certified). The 
 (think / query / answer) with the same frozen LLM and the same retrieval API, without the RL-trained policy.
 Numbers from different LLMs are not comparable; use one model for all systems of a table.
 
+## Conformance with the plan (Evidence-Certificate GraphRAG)
+
+| plan element | status | where |
+|---|---|---|
+| Evidence Obligations O(q) from the frozen LLM | done | `obligations.py` (validated: ids, dependencies, cycles) |
+| Evidence Support Graph G_E(q, a) | done, can be exported | `audit.build_graph`, `export_graph.py` |
+| kappa = provenance-independent support paths, unit = article, unknown source counts once | done | `state.unit`, `state.kappa` |
+| evidence cuts, counterfactual fragility, conflicts X, provenance diversity D, robustness R, coverage C | done | `audit.py`, all in the certificate |
+| actions FillGap, Bridge, Diversify, Challenge, Verify, Answer | done (Answer = the stop rule) | `controller.py` |
+| step reward r = dC + alpha dR + beta dD - gamma dX - lam cost | computed and logged for every step (`reward` in the trace, mean per action in the summary); the controller itself is training-free, so it is a diagnostic and not a learning signal | `controller.execute` |
+| Pareto evidence state | done (default); scalar Risk = (1-C) + lam_x X + lam_r (1-R) as an option | `audit.risk`, `--risk-mode` |
+| VNE(a|s) = E[Risk(s) - Risk(s')] - Cost(a) | approximated: p (success rate per action kind, optionally learned across questions) times a hand-set gain per situation (uncovered obligation, conflict, single source, unverified cut) minus cost. The gains mirror the terms of the Risk but are not computed as an exact expected Risk difference | `Weights`, `Episode.price` |
+| Reasoning Pathology Monitor | retrieval loop, over-retrieval, confirmation bias, premature confidence, ungrounded answer. The ungrounded reasoning leap is checked on the final answer, not on every reasoning edge | `Episode.monitor`, `solve` |
+| STOP: core obligations covered, graph connected, no unresolved critical conflict, critical cuts audited, max VNE <= cost | done; model confidence is not used | `Episode.run`, `audit` |
+| Answer only with a certificate | the default answers anyway and flags the answer as uncertified, so that EM can be reported both ways; `--abstain-uncertified` refuses to answer, and `report.md` shows the selective EM | `solve`, `compare.py` |
+| frozen retrieval (entity + hyperedge dual path, rank fusion) | untouched, used through `/search` | Graph-R1 |
+| comparison with the Graph-R1 agent loop | done, same LLM and API | `baseline.py` |
+| ablations | no Diversify, no Verify, no Bridge, no Challenge, naive provenance (every passage independent), scalar risk, LLM comparison | `pipeline.py --ablations` |
+
+Not implemented: a confidence / answer-stability stop rule as a contrast baseline (the plan removes model
+confidence from the controller), and the learned classifier for sufficiency that was mentioned as future work.
+
 ## Known limits
 
 - The certificate covers retrieved facts. The Verify step cannot catch a passage that is about a different entity
