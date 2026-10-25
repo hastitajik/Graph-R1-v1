@@ -57,6 +57,7 @@ class FakeLLM:
     def __init__(self, reject=(), reform=None, answer="guess"):
         self.reject, self.reform, self.answer = set(reject), reform or {}, answer
         self.calls = {"match": 0, "verify": 0, "reform": 0, "answer": 0}
+        self.informed_prompts, self.match_prompts = [], []
         self.completions = SimpleNamespace(create=self.create)
         self.chat = SimpleNamespace(completions=self.completions)
 
@@ -64,14 +65,18 @@ class FakeLLM:
         sys_, user = messages[0]["content"], messages[1]["content"]
         if sys_.startswith("You check whether"):
             self.calls["match"] += 1
+            self.match_prompts.append(user)
             out = {"matches": self.match(user)}
         elif sys_.startswith("You verify ONE fact"):
             self.calls["verify"] += 1
             passage = user.split("Passage: ", 1)[1]
             out = {"supported": False} if passage in self.reject else {"supported": True, "quote": passage.rstrip(".")}
-        elif sys_.startswith(("Write 2 different", "Write 2 short")):
+        elif sys_.startswith(("Write 2 different", "Write 2 short", "Write 2 new")):
             self.calls["reform"] += 1
-            out = {"queries": self.reform.get("paraphrase" if sys_.startswith("Write 2 different") else "counter", [])}
+            mode = "paraphrase" if sys_.startswith("Write 2 different") else "counter" if sys_.startswith("Write 2 short") else "informed"
+            if mode == "informed":
+                self.informed_prompts.append(user)
+            out = {"queries": self.reform.get(mode, [])}
         else:
             self.calls["answer"] += 1
             out = {"answer": self.answer}

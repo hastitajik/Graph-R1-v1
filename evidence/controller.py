@@ -152,6 +152,13 @@ REFORM_SYSTEM = {
                'names exactly as written. Return ONLY JSON: {"queries": ["...", "..."]}',
 }
 
+REFORM_SYSTEM["informed"] = (
+    "Write 2 new search queries for a retrieval system. The earlier queries did not find a passage that "
+    "states the missing fact. Read the passages retrieved so far (titles and openings): they may name the "
+    "right entity under another title, or show what the corpus calls the relation. Write queries that use "
+    "the exact names and words you see there. Do not repeat an earlier query. Keep entity names exactly as "
+    'written. Return ONLY JSON: {"queries": ["...", "..."]}')
+
 VERIFY_SYSTEM = """You verify ONE fact against ONE passage. Use only the passage, never outside knowledge.
 Answer supported=true only if the passage EXPLICITLY states the fact; mentioning the entities, or a \
 fact that is merely implied, is not enough. If true, copy the exact words that state it.
@@ -176,6 +183,20 @@ async def llm_json(client, model, system, user):
 
 async def llm_queries(client, model, fact, mode):
     obj, err = await llm_json(client, model, REFORM_SYSTEM[mode], f"Fact: {fact}")
+    qs = (obj or {}).get("queries") if isinstance(obj, dict) else None
+    return [str(q) for q in qs if isinstance(q, str)][:2] if isinstance(qs, list) else []
+
+
+def context_snippets(state, n=6, chars=160):
+    """Titles and openings of the best passages retrieved so far (what an informed query may build on)."""
+    best = sorted(state.items.values(), key=lambda it: -it.coherence)[:n]
+    return [f"[{' | '.join(it.titles) or '?'}] {it.text[:chars]}" for it in best]
+
+
+async def informed_queries(client, model, question, fact, tried, snippets):
+    user = (f"Question: {question}\nMissing fact: {fact}\nEarlier queries: {json.dumps(list(tried))}\n\n"
+            "Retrieved so far:\n" + "\n".join(snippets))
+    obj, err = await llm_json(client, model, REFORM_SYSTEM["informed"], user)
     qs = (obj or {}).get("queries") if isinstance(obj, dict) else None
     return [str(q) for q in qs if isinstance(q, str)][:2] if isinstance(qs, list) else []
 
@@ -259,6 +280,15 @@ class Episode:
                 self.flags_seen[k] = 1   # a question is flagged once, however many steps it stays true
         return flags
 
+    def fillgap_mode(self, oid):
+        """Next LLM help for an obligation whose plain queries are used up: one blind paraphrase, then up to
+        two INFORMED rounds that read what was retrieved so far (only if something was retrieved)."""
+        if ("FillGap", oid, "paraphrase") not in self.llm_used:
+            return "paraphrase"
+        if self.state.items and sum(("FillGap", oid, f"informed{i}") in self.llm_used for i in (1, 2)) < 2:
+            return "informed"
+        return None
+
     # ---- proposal
     def _stuck(self, oid, seen=None):
         """True if nothing more can be searched for this obligation (so its dependents need a Bridge)."""
@@ -269,7 +299,7 @@ class Episode:
         if oid in self.dead or ("FillGap", oid) in self.banned:
             return True
         if S.ready(oid):
-            return not fillgap_queries(S, oid) and ("FillGap", oid, "paraphrase") in self.llm_used
+            return not fillgap_queries(S, oid) and self.fillgap_mode(oid) is None
         ups = [d for d in S.obs[oid]["depends_on"] if S.is_retrieve(d) and not S.covered(d)]
         return all(self._stuck(d, seen) for d in ups)
 
@@ -285,7 +315,7 @@ class Episode:
                 if S.ready(oid):
                     if ("FillGap", oid) not in self.banned and oid not in self.dead:
                         det = fillgap_queries(S, oid)
-                        mode = "paraphrase" if (not det and ("FillGap", oid, "paraphrase") not in self.llm_used) else None
+                        mode = self.fillgap_mode(oid) if not det else None
                         if det or mode:
                             acts.append(Action("FillGap", oid, det, mode, gain, "uncovered"))
                 else:
@@ -339,6 +369,7 @@ class Episode:
             S.verified[(oid, key)] = True
             return "supported"
         S.remove_support(oid, key)
+        self.reject_note = {"fact": S.instantiate(oid), "passage": S.items[key].text[:200]}
         return "rejected"
 
     async def execute(self, a: Action, step: int, cert):
@@ -348,13 +379,24 @@ class Episode:
         before = cert.vector
         new_keys = []
         if a.kind == "Verify":
+            self.reject_note = None
             rec["verify"] = await self.verify(a.oid)
+            if self.reject_note:
+                rec["verify_rejected"] = self.reject_note
         else:
             qs = list(a.det)
             if a.llm_mode:
-                self.llm_used.add((a.kind, a.oid, a.llm_mode))
+                mode = a.llm_mode
+                if mode == "informed":
+                    mode = "informed1" if (a.kind, a.oid, "informed1") not in self.llm_used else "informed2"
+                self.llm_used.add((a.kind, a.oid, mode))
                 self.n_llm += 1
-                extra = await llm_queries(self.client, self.args.model, S.instantiate(a.oid), a.llm_mode)
+                if a.llm_mode == "informed":
+                    extra = await informed_queries(self.client, self.args.model, self.question, S.instantiate(a.oid),
+                                                   S.tried(a.oid), context_snippets(S))
+                else:
+                    extra = await llm_queries(self.client, self.args.model, S.instantiate(a.oid), a.llm_mode)
+                rec["llm_queries"] = extra
                 qs = _unique(qs + extra, S.tried(a.oid))
             qs = qs[:a.limit or W.max_queries]
             if a.kind == "Challenge":

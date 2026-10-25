@@ -24,6 +24,10 @@ MAX_OBLIGATIONS = 6
 MAX_ATTEMPTS = 3
 VALID_TYPES = {"compositional", "comparison", "inference", "bridge_comparison", "other"}
 VALID_KINDS = {"retrieve", "derive"}
+# 'film Blue River' / 'the album "X"': the type word right before a name must survive in the obligations
+TYPE_WORDS = ("film|movie|album|song|band|village|river|company|novel|book|city|town|"
+              "county|series|magazine|newspaper|university|school|ship|opera|play")
+TYPE_BEFORE_NAME = re.compile(rf"\b({TYPE_WORDS})\s+(?=[A-Z\"'(])")
 
 SYSTEM_PROMPT = """You decompose a multi-hop question into EVIDENCE OBLIGATIONS.
 
@@ -34,6 +38,9 @@ Rules:
 - Each obligation has: "id" (o1, o2, ...), "text", "depends_on" (list of ids), "kind".
 - "text" is a self-contained statement. Use ?X-style variables (?D, ?M, ?T1) for unknown \
 values. Copy entity names exactly as written in the question, including any parenthesized qualifier such as (Film) or (1989 Film).
+- Keep the type word of a named entity (film, album, band, village, river, company, novel, ...) \
+next to its name in every obligation that mentions it: "the film Blue River", not "Blue River". \
+Other kinds of entity can share the name.
 - "depends_on" lists the obligations whose resolved value this one needs.
 - kind = "retrieve": must be found in the corpus.
 - kind = "derive": computed from other obligations' values (compare dates, same country, \
@@ -90,7 +97,7 @@ def extract_json(text: str):
     return json.loads(text[start : end + 1])
 
 
-def validate(obj: dict, question: str = None) -> list:
+def validate(obj: dict, question: str = None, check_types: bool = True) -> list:
     """Return a list of problems; empty list means valid."""
     errs = []
     if not isinstance(obj, dict):
@@ -126,6 +133,12 @@ def validate(obj: dict, question: str = None) -> list:
         for span in re.findall(r"\([^)]*\)", question):
             if not any(span in str(o.get("text", "")) for o in obs):
                 errs.append(f"qualifier {span} from the question is missing in the obligations")
+
+    if question and check_types:
+        text = " ".join(str(o.get("text", "")) for o in obs).lower()
+        for w in dict.fromkeys(m.lower() for m in TYPE_BEFORE_NAME.findall(question)):
+            if not re.search(rf"\b{w}\b", text):
+                errs.append(f"the type word '{w}' from the question is missing in the obligations")
 
     if obj.get("answer_id") not in ids:
         errs.append("answer_id not in obligations")
