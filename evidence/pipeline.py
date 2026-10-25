@@ -15,15 +15,17 @@ Steps (each is skipped when its output already exists, unless --force):
 The same frozen LLM and the same /search API are used for every system, so the numbers are comparable.
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
+import urllib.request
 
 from evidence import provenance
 from evidence.common import DATA_DIR, LLM_BASE_URL, LLM_MODEL, SEARCH_URL
 
 
-def run(args_list, log_path):
+def run(args_list, log_path, out_path=""):
     cmd = [sys.executable, "-m"] + args_list
     print("+", " ".join(cmd), flush=True)
     with open(log_path, "w", encoding="utf-8") as log:
@@ -31,8 +33,41 @@ def run(args_list, log_path):
     if p.returncode != 0:
         print(f"step failed (exit {p.returncode}); see {log_path}", flush=True)
         sys.exit(p.returncode)
-    tail = open(log_path, encoding="utf-8").read().strip().splitlines()[-8:]
-    print("\n".join("    " + t for t in tail), flush=True)
+    text = open(log_path, encoding="utf-8").read()
+    print("\n".join("    " + t for t in text.strip().splitlines()[-8:]), flush=True)
+    if "call(s) failed" in text:   # the controller reports LLM / search failures; such results are not usable
+        try:
+            os.remove(out_path) if out_path else None
+        except OSError:
+            pass
+        print(f"step finished with failed LLM/search calls, its output was removed; see {log_path}", flush=True)
+        sys.exit(3)
+
+
+def preflight(search_url, api_base, model):
+    """Fail fast, before any long step, when an endpoint is not reachable."""
+    problems = []
+    if " " in search_url or not search_url.startswith("http"):
+        problems.append(f"search url looks wrong: {search_url!r} (is the API container running? docker start graphr1-api-v1)")
+    else:
+        try:
+            req = urllib.request.Request(search_url, data=json.dumps({"queries": ["test"]}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=60).read()
+        except Exception as e:
+            problems.append(f"search API unreachable at {search_url}: {type(e).__name__}: {e}")
+    try:
+        body = json.dumps({"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 5,
+                           "chat_template_kwargs": {"enable_thinking": False}}).encode()
+        req = urllib.request.Request(api_base.rstrip("/") + "/chat/completions", data=body,
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=120).read()
+    except Exception as e:
+        problems.append(f"LLM unreachable at {api_base} (model {model!r}): {type(e).__name__}: {e}")
+    if problems:
+        print("preflight failed:\n  " + "\n  ".join(problems), flush=True)
+        sys.exit(2)
+    print("preflight ok: search API and LLM reachable", flush=True)
 
 
 def main():
@@ -59,12 +94,14 @@ def main():
     os.makedirs(out, exist_ok=True)
     llm = ["--api-base", args.api_base, "--model", args.model]
     srch = ["--search-url", args.search_url]
-    todo = lambda path: args.force or not os.path.exists(path)
+    # an empty output is a failed earlier run, not a result: it is recomputed
+    todo = lambda path: args.force or not os.path.exists(path) or os.path.getsize(path) == 0
+    preflight(args.search_url, args.api_base, args.model)
 
     if todo(provenance.INDEX):
         run(["evidence.provenance", "build"], f"{out}/log_provenance.txt")
     else:
-        print(f"provenance index exists: {provenance.INDEX}")
+        print(f"provenance index exists: {provenance.INDEX}", flush=True)
 
     obl = args.obligations or f"{out}/obligations.jsonl"
     if not args.obligations and todo(obl):
@@ -84,13 +121,13 @@ def main():
     for name, extra in systems.items():
         trace = f"{out}/trace_{name}.jsonl"
         if todo(trace):
-            run(ctrl + extra + ["--out", trace], f"{out}/log_{name}.txt")
+            run(ctrl + extra + ["--out", trace], f"{out}/log_{name}.txt", trace)
         runs[name] = trace
     if not args.skip_baseline:
         trace = f"{out}/trace_baseline.jsonl"
         if todo(trace):
             run(["evidence.baseline", "--obligations", obl, "--n", str(n), "--short",
-                 "--concurrency", str(args.concurrency), "--out", trace] + srch + llm, f"{out}/log_baseline.txt")
+                 "--concurrency", str(args.concurrency), "--out", trace] + srch + llm, f"{out}/log_baseline.txt", trace)
         runs["baseline"] = trace
 
     cmp_cmd = ["evidence.compare", "--out", f"{out}/report.md"]
