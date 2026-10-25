@@ -50,6 +50,9 @@ def main():
             mark = "OK" if o["covered"] else ("--" if o["kind"] == "retrieve" else "dv")
             print(f"   [{mark}] {o['id']} k={o['kappa']} {o['text']}  {o['titles']}")
         print("   bindings:", r["bindings"])
+        why = [f"{o}: {w}" for st in r.get("steps", []) for o, w in (st.get("rejected") or [])]
+        if why:
+            print("   mapper rejections:", "; ".join(dict.fromkeys(why))[:600])
         qs = [(f"{o['id']}:obligation", make_query(o["text"]))
               for o in r["obligations"] if o["kind"] == "retrieve" and not o["covered"]]
         qs.append(("whole question", r["question"]))
