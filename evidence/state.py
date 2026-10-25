@@ -61,7 +61,9 @@ def subject_in(value: str, titles, passage: str) -> bool:
         if tn and (tn in norm(value) or norm(value) in tn):
             return True
     vt = _tokens(value)
-    return not vt or len(vt & _tokens(" ".join(titles or []) + " " + passage)) / len(vt) >= 0.5
+    # two-word names need both words ('William Clemens' is not 'William I, Count of Nassau-Dillenburg')
+    need = 0.6 if len(vt) <= 3 else 0.5
+    return not vt or len(vt & _tokens(" ".join(titles or []) + " " + passage)) / len(vt) >= need
 
 
 _HONORIFIC = {"sir", "dr", "mr", "lord", "lady", "saint"}
@@ -290,6 +292,11 @@ class EvidenceState:
                 return False, why
             if SELF_CHECK and is_self_reference(val, self.question):
                 return False, f"self-reference: {val} is the entity the question asks about"
+            if SELF_CHECK:  # 'the father of X is X' (an entity is not its own parent / spouse / ...)
+                for dv in self.dep_vars(oid):
+                    other = self.value(dv)
+                    if other and norm(other) == norm(val):
+                        return False, f"self-reference: {v} equals {dv} ({val})"
         if SUBJECT_CHECK:  # the passage must be about the entity the chain arrived at
             for v in sorted(self.dep_vars(oid)):
                 ent = self.value(v)

@@ -230,5 +230,22 @@ class ExportGraph(unittest.TestCase):
         self.assertEqual(G.number_of_nodes(), 4)
 
 
+class Round2(unittest.TestCase):
+    def test_two_word_name_needs_both_words(self):          # William Clemens vs William I, Count of Nassau-Dillenburg
+        from evidence.state import subject_in
+        self.assertFalse(subject_in("William Clemens", ["William I, Count of Nassau-Dillenburg"],
+                                    "William I, Count of Nassau-Dillenburg was born in Dillenburg"))
+        self.assertTrue(subject_in("William Clemens", ["William Clemens"], "William Clemens was born in Saginaw"))
+
+    def test_entity_is_not_its_own_father(self):            # Lewis Watson is the father of Lewis Watson
+        st = mk([{"id": "o1", "text": "The father of E is ?F", "depends_on": [], "kind": "retrieve"},
+                 {"id": "o2", "text": "The father of ?F is ?G", "depends_on": ["o1"], "kind": "retrieve"}], "o2")
+        hold(st, "a", "E", "Lewis Watson is the father of E", "o1", {"?F": "Lewis Watson"})
+        it = hold(st, "b", "Lewis Watson", "Lewis Watson, 1st Earl, son of Lewis Watson")
+        ok, why = st.validate_match("o2", it, {"?G": "Lewis Watson"}, "Lewis Watson, 1st Earl, son of Lewis Watson")
+        self.assertFalse(ok)
+        self.assertIn("self-reference", why)
+
+
 if __name__ == "__main__":
     unittest.main()

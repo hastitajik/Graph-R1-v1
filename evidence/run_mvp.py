@@ -170,8 +170,10 @@ async def map_and_apply(client, model, state, keys, oids, texts=None):
 ANSWER_SYSTEM = """Answer the question using ONLY the established facts below.
 Compare values when the question asks for it (earlier/later, older/younger, same country).
 Give a SHORT answer: a name, date, place, or yes/no. For "which film/person" questions answer \
-with the name exactly as written in the question. If a fact is marked NOT FOUND, make your \
-best guess from the remaining facts.
+with the name exactly as written in the question. Copy a value as it is written in the facts: \
+do not turn a nationality (French) into a country name (France). For a place give only the place \
+name, without the date or the long description that may follow it. If a fact is marked NOT FOUND, \
+make your best guess from the remaining facts.
 Return ONLY JSON: {"answer": "..."}"""
 
 
