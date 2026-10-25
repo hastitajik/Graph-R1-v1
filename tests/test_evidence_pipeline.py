@@ -52,6 +52,12 @@ class Pipeline(unittest.TestCase):
         import evidence.pipeline as P
         self.assertTrue(callable(P.main))
 
+    def test_preflight_rejects_a_dead_api_container(self):      # docker inspect printed "invalid IP"
+        import evidence.pipeline as P
+        with self.assertRaises(SystemExit) as cm:
+            P.preflight("http://invalid IP:8001/search", "http://127.0.0.1:9/v1", "m")
+        self.assertEqual(cm.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
