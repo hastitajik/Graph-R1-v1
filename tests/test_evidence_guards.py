@@ -130,5 +130,70 @@ class DiversifyScope(unittest.TestCase):
         self.assertFalse(st.covered("o2"))
 
 
+class SelfReference(unittest.TestCase):
+    def test_uncle_cannot_be_the_subject(self):             # question 22: 'uncle of James' bound to James
+        st = mk([{"id": "o1", "text": "The father of James Fitzgerald, 6th Earl of Desmond is ?F",
+                  "depends_on": [], "kind": "retrieve"},
+                 {"id": "o2", "text": "The brother of ?F is ?U", "depends_on": ["o1"], "kind": "retrieve"}], "o2")
+        st.question = "Who is the uncle of James Fitzgerald, 6Th Earl Of Desmond?"
+        hold(st, "a", "James", "Gerald is the father of James", "o1", {"?F": "Gerald FitzGerald"})
+        it = hold(st, "b", "Gerald FitzGerald", "Gerald FitzGerald, brother James FitzGerald, 6th Earl of Desmond")
+        ok, why = st.validate_match("o2", it, {"?U": "James FitzGerald, 6th Earl of Desmond"},
+                                    "brother James FitzGerald, 6th Earl of Desmond")
+        self.assertFalse(ok)
+        self.assertIn("self-reference", why)
+
+    def test_other_person_is_fine(self):
+        st = mk([{"id": "o1", "text": "The father of B is ?F", "depends_on": [], "kind": "retrieve"}], "o1")
+        st.question = "Who is the father of Beata Laska?"
+        it = hold(st, "a", "Beata", "Andrzej Koscielecki is the father of Beata Laska")
+        ok, _ = st.validate_match("o1", it, {"?F": "Andrzej Koscielecki"}, "Andrzej Koscielecki is the father")
+        self.assertTrue(ok)
+
+
+class Aliases(unittest.TestCase):
+    def test_same_person_two_spellings_is_no_conflict(self):    # question 29: Infanta Elena
+        from evidence.state import same_entity
+        self.assertTrue(same_entity("Infanta Elena of Spain", "Infanta Elena, Duchess of Lugo"))
+        self.assertFalse(same_entity("Sir Paul Gore, 1st Baronet", "Sir Paul Rycaut"))
+        self.assertFalse(same_entity("Ralph Gore, 2nd Baronet", "Ralph Gore, 3rd Baronet"))
+        self.assertFalse(same_entity("Henry II", "Henry III"))
+        self.assertFalse(same_entity("1 May 1900", "2 May 1900"))
+        st = mk([{"id": "o1", "text": "The mother of F is ?M", "depends_on": [], "kind": "retrieve"}], "o1")
+        hold(st, "a", "F", "Infanta Elena of Spain is the mother of F", "o1", {"?M": "Infanta Elena of Spain"})
+        hold(st, "b", "Elena", "Infanta Elena, Duchess of Lugo is the mother of F", "o1",
+             {"?M": "Infanta Elena, Duchess of Lugo"})
+        self.assertEqual(st.conflicts(), {})
+
+
+class AnswerGrounded(unittest.TestCase):
+    def test_not_found_and_stray_answers_are_not_certified(self):
+        st = mk([{"id": "o1", "text": "X studied at ?S", "depends_on": [], "kind": "retrieve"}], "o1")
+        hold(st, "a", "X", "X studied at Eton College (1796) and Christ Church", "o1",
+             {"?S": "Eton College (1796) and Christ Church"})
+        self.assertFalse(C.answer_grounded(st, "NOT FOUND")[0])
+        self.assertFalse(C.answer_grounded(st, "")[0])
+        self.assertFalse(C.answer_grounded(st, "Harvard")[0])
+        self.assertTrue(C.answer_grounded(st, "Eton College (1796) and Christ Church")[0])
+
+
+class Ablations(unittest.TestCase):
+    def test_disabled_kinds_are_never_proposed(self):
+        st = mk([{"id": "o1", "text": "The director of F is ?D", "depends_on": [], "kind": "retrieve"}], "o1")
+        hold(st, "a", "F", "Anna Berg directed F", "o1", {"?D": "Anna Berg"})
+        args = types.SimpleNamespace(model="m", search_url="x", max_searches=10, max_steps=5)
+        ep = C.Episode(st, "q", None, args, C.Weights(disabled=("Diversify",)))
+        kinds = {a.kind for a in ep.propose(audit(st), ep.monitor(audit(st)))}
+        self.assertNotIn("Diversify", kinds)
+        self.assertIn("Verify", kinds)
+
+    def test_learned_p_drops_after_failures(self):
+        st = mk([{"id": "o1", "text": "X is ?A", "depends_on": [], "kind": "retrieve"}], "o1")
+        args = types.SimpleNamespace(model="m", search_url="x", max_searches=10, max_steps=5)
+        W = C.Weights(learn_p=True, seen={"Diversify": [0, 40]})
+        self.assertLess(C.Episode(st, "q", None, args, W).p("Diversify"), 0.05)
+        self.assertEqual(C.Episode(st, "q", None, args, C.Weights()).p("Diversify"), 0.25)
+
+
 if __name__ == "__main__":
     unittest.main()

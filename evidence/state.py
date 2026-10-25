@@ -25,6 +25,7 @@ from evidence.provenance import norm
 UNKNOWN = "UNKNOWN"
 MIN_QUOTE = 10  # normalized characters
 NO_DROP = frozenset()
+SELF_CHECK = os.environ.get("EVIDENCE_SELF_CHECK", "1") != "0"
 SUBJECT_CHECK = os.environ.get("EVIDENCE_SUBJECT_CHECK", "1") != "0"
 
 # ---- cheap guards against wrong bindings (found in real traces) ---------------------------------
@@ -63,6 +64,36 @@ def subject_in(value: str, titles, passage: str) -> bool:
     return not vt or len(vt & _tokens(" ".join(titles or []) + " " + passage)) / len(vt) >= 0.5
 
 
+_HONORIFIC = {"sir", "dr", "mr", "lord", "lady", "saint"}
+_SUFFIX = {"jr", "sr", "ii", "iii", "iv", "vi", "vii", "viii", "ix"}
+
+
+def _sig(s: str) -> list:
+    return [w for w in re.findall(r"\w+", s.lower()) if w not in _HONORIFIC and w not in {"the", "of", "and"}]
+
+
+def same_entity(a: str, b: str) -> bool:
+    """Conservative alias test for two surface forms of one name ('Infanta Elena of Spain' ~
+    'Infanta Elena, Duchess of Lugo'): same first two significant words, no digits, same suffixes.
+    Anything with digits (dates, ordinals) must match exactly."""
+    if norm(a) == norm(b):
+        return True
+    if re.search(r"\d", a) or re.search(r"\d", b):
+        return False
+    ta, tb = _sig(a), _sig(b)
+    if len(ta) < 2 or len(tb) < 2 or ta[:2] != tb[:2]:
+        return False
+    return {w for w in ta if w in _SUFFIX} == {w for w in tb if w in _SUFFIX}
+
+
+def is_self_reference(value: str, question: str) -> bool:
+    """The value is just the entity the question is about (e.g. 'uncle of X' bound to X itself)."""
+    if not question or re.search(r"\d{4}", value):
+        return False
+    vt = _tokens(value)
+    return len(vt) >= 2 and vt <= _tokens(question)
+
+
 @dataclass
 class Item:
     key: str
@@ -79,6 +110,7 @@ class EvidenceState:
         self.obs = {o["id"]: o for o in obligations["obligations"]}
         self.order = [o["id"] for o in obligations["obligations"]]
         self.answer_id = obligations["answer_id"]
+        self.question = ""                           # set by the caller; used by the self-reference guard
         self.items = {}                              # item key -> Item
         self.support = {oid: {} for oid in self.obs}  # oid -> {item key: {var: value}}
         self.context = {}                            # (oid, item key) -> inherited values at match time
@@ -168,7 +200,10 @@ class EvidenceState:
                     ctx = self.dep_context(oid, drop)
                 if self.context.get((oid, key), {}) != ctx:
                     continue
-                c = cands.setdefault(norm(b[var]), {"value": b[var], "items": set()})
+                k = norm(b[var])
+                if k not in cands:  # a second surface form of the same name is not a conflict
+                    k = next((x for x, c0 in cands.items() if same_entity(c0["value"], b[var])), k)
+                c = cands.setdefault(k, {"value": b[var], "items": set()})
                 c["items"].add(key)
         return cands
 
@@ -253,6 +288,8 @@ class EvidenceState:
             ok, why = self.type_ok(oid, v, val)
             if not ok:
                 return False, why
+            if SELF_CHECK and is_self_reference(val, self.question):
+                return False, f"self-reference: {val} is the entity the question asks about"
         if SUBJECT_CHECK:  # the passage must be about the entity the chain arrived at
             for v in sorted(self.dep_vars(oid)):
                 ent = self.value(v)
