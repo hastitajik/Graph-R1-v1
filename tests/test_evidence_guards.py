@@ -215,5 +215,20 @@ class Baseline(unittest.TestCase):
         self.assertEqual((r["answer"], r["em"], r["searches"], r["turns"]), ("Anna Berg", 1.0, 1, 2))
 
 
+class ExportGraph(unittest.TestCase):
+    def test_graph_has_dependency_and_support_edges(self):
+        from evidence.export_graph import build
+        ob = {"obligations": {"obligations": [
+            {"id": "o1", "text": "The director of A is ?D", "kind": "retrieve", "depends_on": []},
+            {"id": "o2", "text": "?D was born on ?T", "kind": "retrieve", "depends_on": ["o1"]}], "answer_id": "o2"}}
+        t = {"question": "q", "answer": "1950", "certified": True, "certificate": {"unaudited": []},
+             "obligations": [{"id": "o1", "text": "The director of A is Neri", "covered": True, "titles": ["A (film)"]},
+                             {"id": "o2", "text": "Neri was born on 1950", "covered": True, "titles": ["Neri Parenti"]}]}
+        G = build(t, ob)
+        self.assertTrue(G.has_edge("o1", "o2"))
+        self.assertTrue(G.has_edge("unit:Neri Parenti", "o2"))
+        self.assertEqual(G.number_of_nodes(), 4)
+
+
 if __name__ == "__main__":
     unittest.main()
