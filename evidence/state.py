@@ -86,6 +86,10 @@ def same_entity(a: str, b: str) -> bool:
     if re.search(r"\d", a) or re.search(r"\d", b):
         return False
     ta, tb = _sig(a), _sig(b)
+    # a bare surname is the same person as the full name that ends in it ('Annakin' ~ 'Ken Annakin')
+    for one, full in ((ta, tb), (tb, ta)):
+        if len(one) == 1 and len(one[0]) >= 4 and len(full) >= 2 and full[-1] == one[0]:
+            return True
     if len(ta) < 2 or len(tb) < 2 or ta[:2] != tb[:2]:
         return False
     return {w for w in ta if w in _SUFFIX} == {w for w in tb if w in _SUFFIX}

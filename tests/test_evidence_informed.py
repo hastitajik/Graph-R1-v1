@@ -100,3 +100,13 @@ class CompareStats(unittest.TestCase):
         text = report({"a": [mk(1.0, True)], "b": [mk(0.0, False)]}, rejected=True)
         for part in ("EM 95% CI", "Selective prediction", "Paired comparison", "Verify rejections"):
             self.assertIn(part, text)
+
+
+class SurnameAlias(unittest.TestCase):
+    def test_bare_surname_is_the_same_entity(self):
+        from evidence.state import same_entity
+        self.assertTrue(same_entity("Annakin", "Ken Annakin"))
+        self.assertTrue(same_entity("Ken Annakin", "Annakin"))
+        self.assertFalse(same_entity("Lee", "Ann Lee"))            # too short to be safe
+        self.assertFalse(same_entity("Ann Lee", "Bob Roe"))
+        self.assertFalse(same_entity("1999", "Ann 1999"))
