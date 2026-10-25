@@ -54,7 +54,7 @@ from dataclasses import dataclass, field, replace
 
 from openai import AsyncOpenAI
 
-from evidence.audit import audit, pareto_improves, required_retrieve
+from evidence.audit import audit, pareto_improves, required_retrieve, risk
 from evidence.common import LLM_BASE_URL, LLM_MODEL, SEARCH_URL
 from evidence.derive import derive_answer
 from evidence.metrics import em_f1
@@ -84,6 +84,9 @@ class Weights:
     stall_limit: int = 3
     novelty_limit: int = 2
     max_queries: int = 2      # queries per search action
+    risk_mode: str = "pareto"  # "pareto": a step must not worsen any component; "scalar": Risk(s) must drop
+    lam_x: float = 0.5         # weight of unresolved conflicts in the scalar risk
+    lam_r: float = 0.5         # weight of (1 - robustness) in the scalar risk
     learn_p: bool = False     # carry the success counts of each action kind over to the next questions
     disabled: tuple = ()      # action kinds switched off (ablations)
     seen: dict = field(default_factory=lambda: {})  # kind -> [successes, attempts] over all questions
@@ -200,6 +203,15 @@ class Episode:
         self.n_search = self.n_llm = 0
         self.steps = []
         self.flags_seen = Counter()
+
+    def better(self, before, after, kind):
+        """Did the step help? A search that DISCOVERS a conflicting value (Diversify / Challenge) also counts:
+        it makes the state look worse on paper (X grows) but it is exactly the evidence the audit needs."""
+        if self.W.risk_mode == "scalar":
+            ok = risk(before, self.W.lam_x, self.W.lam_r) - risk(after, self.W.lam_x, self.W.lam_r) > 1e-9
+        else:
+            ok = pareto_improves(before, after)
+        return ok or (kind in ("Diversify", "Challenge") and after[3] < before[3])
 
     # ---- probabilities, costs
     def p(self, kind):
@@ -374,7 +386,7 @@ class Episode:
                     if self.zero_novelty[a.oid] >= W.novelty_limit:
                         self.dead.add(a.oid)
         after = audit(S)
-        improved = pareto_improves(before, after.vector)
+        improved = self.better(before, after.vector, a.kind)
         self.stats[a.kind][1] += 1
         self.stats[a.kind][0] += int(improved)
         g = self.W.seen.setdefault(a.kind, [0, 0])
@@ -453,6 +465,7 @@ async def solve(client, args, prov, rec, W=None):
     grounded, why = answer_grounded(state, ans)
     certified = cert.complete and (grounded or abstained)
     cert_d = cert.to_dict()
+    cert_d["risk"] = round(risk(cert.vector, W.lam_x, W.lam_r), 4)
     if cert.complete and not certified:
         cert_d["reasons"] = list(cert_d.get("reasons", [])) + [why]
         if stop == "certified":
@@ -554,6 +567,10 @@ async def main():
     ap.add_argument("--learn-p", action="store_true",
                     help="keep per-action success counts across questions (use with --concurrency 1)")
     ap.add_argument("--disable", default="", help="comma list of action kinds to switch off, e.g. Diversify,Verify")
+    ap.add_argument("--risk-mode", choices=("pareto", "scalar"), default="pareto",
+                    help="how a step is judged: Pareto vector (default) or the scalar Risk of the plan")
+    ap.add_argument("--lam-x", type=float, default=0.5, help="scalar risk: weight of unresolved conflicts")
+    ap.add_argument("--lam-r", type=float, default=0.5, help="scalar risk: weight of (1 - robustness)")
     ap.add_argument("--out", default="trace_ctrl.jsonl")
     ap.add_argument("--show", action="store_true")
     for f in ("gap", "conflict", "challenge", "fragile", "unverified", "c_search", "c_llm", "prior_succ", "prior_att"):
@@ -563,7 +580,7 @@ async def main():
     args = ap.parse_args()
     if not args.search_url:
         ap.error("--search-url (or EVIDENCE_SEARCH_URL) is required")
-    W = replace(d, learn_p=args.learn_p, disabled=tuple(k for k in args.disable.split(",") if k),
+    W = replace(d, learn_p=args.learn_p, risk_mode=args.risk_mode, lam_x=args.lam_x, lam_r=args.lam_r, disabled=tuple(k for k in args.disable.split(",") if k),
                 **{f: getattr(args, f"w_{f}") for f in ("gap", "conflict", "challenge", "fragile", "unverified",
                                                           "c_search", "c_llm", "prior_succ", "prior_att")},
                 **{f: getattr(args, f) for f in ("stall_limit", "novelty_limit", "max_queries")})

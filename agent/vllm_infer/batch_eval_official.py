@@ -1,3 +1,4 @@
+import os
 import json, os, argparse
 from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
@@ -8,7 +9,7 @@ from agent.tool.tool_env import ToolEnv
 from agent.tool.tools import _default_tools
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--api-base", default="http://192.168.4.114:5577/v1")
+ap.add_argument("--api-base", default=os.environ.get("GRAPHR1_LLM_BASE_URL", "http://localhost:8000/v1"))
 ap.add_argument("--model", default="Qwen3.8-27B")
 ap.add_argument("--data", default="datasets/2WikiMultiHopQA/raw/qa_test.json")
 ap.add_argument("--out", default="expr_results/Qwen3.8-27B_2WikiMultiHopQA_agent")

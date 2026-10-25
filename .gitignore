@@ -192,3 +192,7 @@ run_*.log
 *.log
 nohup.out
 graphs/
+
+# evidence pipeline run folders and backups
+runs/
+*.bak

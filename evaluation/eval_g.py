@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 
 # 设置 OpenAI API 密钥
-client = OpenAI(base_url="http://192.168.4.114:5577/v1", api_key="dummy")
+client = OpenAI(base_url=os.environ.get("GRAPHR1_LLM_BASE_URL", "http://localhost:8000/v1"), api_key="dummy")
 JUDGE_MODEL = "Qwen3.8-27B"
 
 def cal_gen(question, answers, generation):

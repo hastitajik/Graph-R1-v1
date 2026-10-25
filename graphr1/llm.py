@@ -521,7 +521,7 @@ async def qwen38_complete(prompt, system_prompt=None, history_messages=[], **kwa
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
-        base_url="http://192.168.4.114:5577/v1",
+        base_url=os.environ.get("GRAPHR1_LLM_BASE_URL", "http://localhost:8000/v1"),
         api_key="dummy",
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         **kwargs,

@@ -1,10 +1,11 @@
+import os
 import json, re, os, argparse, requests
 from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 from tqdm import tqdm
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--api-base", default="http://192.168.4.114:5577/v1")
+ap.add_argument("--api-base", default=os.environ.get("GRAPHR1_LLM_BASE_URL", "http://localhost:8000/v1"))
 ap.add_argument("--model", default="Qwen3.8-27B")
 ap.add_argument("--data", default="datasets/2WikiMultiHopQA/raw/qa_test.json")
 ap.add_argument("--search-url", default="http://localhost:8001/search")
