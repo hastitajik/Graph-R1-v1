@@ -33,6 +33,8 @@ def main():
     if not args.search_url:
         ap.error("--search-url (or EVIDENCE_SEARCH_URL) is required")
     recs = [json.loads(l) for l in open(args.trace, encoding="utf-8")]
+    cats = {"yes_no": [], "wrong_but_covered": [], "mapping_miss": [], "retrieved_only_by_whole_question": [],
+            "retrieval_miss": [], "search_failed": []}
     for i, r in enumerate(recs):
         if r["em"] == 1:
             continue
@@ -40,6 +42,7 @@ def main():
         head = f"[{i}] cov={r['coverage']:.2f} stop={r['stop']} ans='{r['answer'][:40]}' gold={golds[:2]}"
         if any(g.lower() in ("yes", "no") for g in golds):
             print(head, "| yes/no (no span to check) |", r["question"][:60])
+            cats["yes_no"].append(i)
             continue
         print("\n" + head)
         print("   Q:", r["question"])
@@ -50,15 +53,31 @@ def main():
         qs = [(f"{o['id']}:obligation", make_query(o["text"]))
               for o in r["obligations"] if o["kind"] == "retrieve" and not o["covered"]]
         qs.append(("whole question", r["question"]))
+        hits = {}
         for label, q in qs:
             try:
                 res = parse_results(retrieve_sync(args.search_url, q))
             except Exception as e:
                 print(f"   {label}: search failed: {e}")
+                hits[label] = None
                 continue
             h = first_hit(res, golds)
+            hits[label] = bool(h)
             print(f"   {label:18s} q='{q[:55]}' n={len(res)} gold_in_results="
                   + (f"rank {h[0]} | {h[1]}" if h else "NO"))
+        if r["coverage"] >= 1.0:
+            cats["wrong_but_covered"].append(i)      # every obligation was covered, the answer is still wrong
+        elif None in hits.values():
+            cats["search_failed"].append(i)
+        elif any(v for k, v in hits.items() if k.endswith(":obligation")):
+            cats["mapping_miss"].append(i)           # the gold text WAS retrieved by an obligation query
+        elif hits.get("whole question"):
+            cats["retrieved_only_by_whole_question"].append(i)
+        else:
+            cats["retrieval_miss"].append(i)
+    print("\n==== failure categories (questions with EM=0)")
+    for k, v in cats.items():
+        print(f"{k:34s} {len(v):3d}  {v}")
 
 
 if __name__ == "__main__":
