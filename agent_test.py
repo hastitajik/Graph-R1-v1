@@ -1,7 +1,8 @@
+import os
 import requests
 from openai import OpenAI
 
-client = OpenAI(base_url="http://192.168.4.114:5577/v1", api_key="EMPTY")
+client = OpenAI(base_url=os.environ.get("GRAPHR1_LLM_BASE_URL", "http://localhost:8000/v1"), api_key="EMPTY")
 
 INSTR = """Answer the given question. You can query from knowledge base provided to you to answer the question. You can query knowledge as many times as you want.
 You must first conduct reasoning inside <think>...</think>. If you need to query knowledge, you can set a query statement between <query>...</query> to query from knowledge base after <think>...</think>.

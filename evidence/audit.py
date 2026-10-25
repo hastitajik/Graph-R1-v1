@@ -92,6 +92,15 @@ def graph_critical_cuts(G, oids):
     return cuts
 
 
+def risk(vector, lam_x=0.5, lam_r=0.5):
+    """Scalar risk of an evidence state (lower is better):
+        Risk = (1 - C) + lam_x * X + lam_r * (1 - R)
+    C coverage, X number of unresolved conflicts, R structural robustness. The weights are hand-set
+    hyper-parameters. Model confidence is deliberately not part of it."""
+    c, r, _d, neg_x = vector
+    return (1.0 - c) + lam_x * (-neg_x) + lam_r * (1.0 - r)
+
+
 def pareto_improves(before, after, eps=1e-9):
     """True if no component got worse and at least one got better (higher is better)."""
     if any(a < b - eps for a, b in zip(after, before)):
