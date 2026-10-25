@@ -76,7 +76,7 @@ class ValidateVariables(unittest.TestCase):
                 for line in f:
                     r = json.loads(line)
                     if r["ok"]:
-                        self.assertEqual(validate(r["obligations"], r["question"]), [], r["question"])
+                        self.assertEqual(validate(r["obligations"], r["question"], check_types=False), [], r["question"])
 
 
 class Metrics(unittest.TestCase):

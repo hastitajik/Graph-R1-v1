@@ -42,6 +42,9 @@ passage EXPLICITLY states that fact. Use only the passage, never outside knowled
 If it does, return the value of every ?variable in the obligation exactly as written in \
 the passage, and copy a short quote (the exact words) that states the fact.
 Skip passages that merely mention the entity without stating the fact.
+The question the obligations come from is given for context. Several entities can share one name \
+(a film, an album, a band, a village): accept a passage only if it is about the kind of entity the \
+question and the obligation talk about, and skip it if it is about a same-named entity of another kind.
 
 Return ONLY a JSON object:
 {"matches":[{"passage":0,"obligation":"o1","bindings":{"?D":"value"},"quote":"exact words"}]}
@@ -106,7 +109,8 @@ async def map_passages(client, model, state, new_keys, ready_oids, texts=None):
     items = [state.items[k] for k in new_keys]
     obs = "\n".join(f"{oid}: {(texts or {}).get(oid) or state.instantiate(oid)}" for oid in ready_oids)
     pas = "\n".join(f"[{i}] {it.text[:PASSAGE_CHARS]}" for i, it in enumerate(items))
-    user = f"Obligations:\n{obs}\n\nPassages:\n{pas}"
+    q = (getattr(state, "question", "") or "").strip()
+    user = (f"Question: {q}\n\n" if q else "") + f"Obligations:\n{obs}\n\nPassages:\n{pas}"
     raw = None
     dbg = {"error": None, "raw_text": None, "proposed": 0}
     for attempt in range(3):

@@ -39,6 +39,7 @@ question
    EVIDENCE_SEARCH_URL     http://<api-host>:8001/search
    EVIDENCE_DATA_DIR       expr/2WikiMultiHopQA (graphml, chunk store, provenance index)
    ```
+3b. After a graph rebuild delete `$EVIDENCE_DATA_DIR/provenance_index.json` (the pipeline reuses an existing one) or pass `--force`.
 4. Everything in one command (provenance index, obligations, controller, baseline, report, graphs):
    ```
    python3 -m evidence.pipeline --dataset datasets/2WikiMultiHopQA/raw/qa_test.json --n 100 \
@@ -91,7 +92,10 @@ Numbers from different LLMs are not comparable; use one model for all systems of
 | Answer only with a certificate | the default answers anyway and flags the answer as uncertified, so that EM can be reported both ways; `--abstain-uncertified` refuses to answer, and `report.md` shows the selective EM | `solve`, `compare.py` |
 | frozen retrieval (entity + hyperedge dual path, rank fusion) | untouched, used through `/search` | Graph-R1 |
 | comparison with the Graph-R1 agent loop | done, same LLM and API | `baseline.py` |
-| ablations | no Diversify, no Verify, no Bridge, no Challenge, naive provenance (every passage independent), scalar risk, LLM comparison | `pipeline.py --ablations` |
+| ablations | no Diversify / Verify / Bridge / Challenge, FillGap only, no fragility term, guards off, naive provenance (every passage independent), scalar risk, LLM comparison | `pipeline.py --ablations` |
+| informed query (repair of a missed first hop) | when the plain queries of an obligation are used up: one blind paraphrase, then up to two LLM queries that read titles and openings of the passages retrieved so far | `controller.informed_queries`, `Episode.fillgap_mode` |
+| entity type in matching | the matcher sees the question and skips same-named entities of another kind; obligations must keep the type word (film, album, village ...) | `run_mvp.MAP_SYSTEM`, `obligations.validate` |
+| statistics | Wilson CI of EM, paired wins / losses, exact McNemar, bootstrap CI of the difference, selective prediction by certified / coverage / grounded | `compare.py` |
 
 Not implemented: a confidence / answer-stability stop rule as a contrast baseline (the plan removes model
 confidence from the controller), and the learned classifier for sufficiency that was mentioned as future work.
@@ -101,4 +105,4 @@ confidence from the controller), and the learned classifier for sufficiency that
 - The certificate covers retrieved facts. The Verify step cannot catch a passage that is about a different entity
   with the same name; the final comparison is computed only for dates, other derive steps are an LLM step.
 - Independent second sources are rare in 2WikiMultiHopQA (a fact lives in one article), so D stays near 0 there.
-- Retrieval misses on the first hop cannot be repaired by the controller.
+- A first-hop miss is only repaired when the informed queries find the right title; if the corpus never returns it, the question stays uncertified.

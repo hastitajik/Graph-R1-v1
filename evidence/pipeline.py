@@ -7,8 +7,8 @@ Steps (each is skipped when its output already exists, unless --force):
   1. provenance index   (python3 -m evidence.provenance build)
   2. obligations        (python3 -m evidence.obligations)            -> <out-dir>/obligations.jsonl
   3. controller         (python3 -m evidence.controller)             -> <out-dir>/trace_controller.jsonl
-  4. ablations          (--ablations: no Diversify / Verify / Bridge / Challenge, naive provenance, scalar risk,
-                        LLM comparison)
+  4. ablations          (--ablations: no Diversify / Verify / Bridge / Challenge, only FillGap, no fragility term,
+                        guards off, naive provenance, scalar risk, LLM comparison)
   5. baseline           (python3 -m evidence.baseline --short)       -> <out-dir>/trace_baseline.jsonl
   6. report             (python3 -m evidence.compare)                -> <out-dir>/report.md
   7. support graphs     (python3 -m evidence.export_graph)           -> <out-dir>/graphs/
@@ -26,11 +26,11 @@ from evidence import provenance
 from evidence.common import DATA_DIR, LLM_BASE_URL, LLM_MODEL, SEARCH_URL
 
 
-def run(args_list, log_path, out_path=""):
+def run(args_list, log_path, out_path="", env=None):
     cmd = [sys.executable, "-m"] + args_list
     print("+", " ".join(cmd), flush=True)
     with open(log_path, "w", encoding="utf-8") as log:
-        p = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
+        p = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=dict(os.environ, **(env or {})))
     if p.returncode != 0:
         print(f"step failed (exit {p.returncode}); see {log_path}", flush=True)
         sys.exit(p.returncode)
@@ -123,11 +123,20 @@ def main():
         systems.update({"no_diversify": ["--disable", "Diversify"], "no_verify": ["--disable", "Verify"],
                         "no_bridge": ["--disable", "Bridge"], "no_challenge": ["--disable", "Challenge"],
                         "naive_provenance": ["--unit", "passage"],
-                        "scalar_risk": ["--risk-mode", "scalar"], "llm_compare": ["--no-det-compare"]})
+                        "scalar_risk": ["--risk-mode", "scalar"], "llm_compare": ["--no-det-compare"],
+                        "fillgap_only": ["--disable", "Diversify,Bridge,Challenge,Verify"],
+                        "no_fragility": ["--w-fragile", "0"],
+                        "no_guards": ["--env", "EVIDENCE_SELF_CHECK=0", "--env", "EVIDENCE_SUBJECT_CHECK=0"]})
     for name, extra in systems.items():
         trace = f"{out}/trace_{name}.jsonl"
+        env = {}                                   # "--env K=V" pairs are environment switches, not controller flags
+        while "--env" in extra:
+            i = extra.index("--env")
+            k, _, v = extra[i + 1].partition("=")
+            env[k] = v
+            extra = extra[:i] + extra[i + 2:]
         if args.force or not done(trace):
-            run(ctrl + extra + ["--out", trace], f"{out}/log_{name}.txt", trace)
+            run(ctrl + extra + ["--out", trace], f"{out}/log_{name}.txt", trace, env)
         runs[name] = trace
     if not args.skip_baseline:
         trace = f"{out}/trace_baseline.jsonl"
@@ -136,7 +145,7 @@ def main():
                  "--concurrency", str(args.concurrency), "--out", trace] + srch + llm, f"{out}/log_baseline.txt", trace)
         runs["baseline"] = trace
 
-    cmp_cmd = ["evidence.compare", "--out", f"{out}/report.md"]
+    cmp_cmd = ["evidence.compare", "--rejected", "--out", f"{out}/report.md"]
     for k, v in runs.items():
         cmp_cmd += ["--run", f"{k}={v}"]
     run(cmp_cmd, f"{out}/log_report.txt")
