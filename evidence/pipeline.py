@@ -42,6 +42,8 @@ def run(args_list, log_path, out_path=""):
             pass
         print(f"step finished with failed LLM/search calls, its output was removed; see {log_path}", flush=True)
         sys.exit(3)
+    if out_path:
+        open(out_path + ".ok", "w").close()   # only a trace with this marker is reused by a later run
 
 
 def preflight(search_url, api_base, model):
@@ -96,6 +98,7 @@ def main():
     srch = ["--search-url", args.search_url]
     # an empty output is a failed earlier run, not a result: it is recomputed
     todo = lambda path: args.force or not os.path.exists(path) or os.path.getsize(path) == 0
+    done = lambda path: os.path.exists(path + ".ok") and os.path.getsize(path) > 0
     preflight(args.search_url, args.api_base, args.model)
 
     if todo(provenance.INDEX):
@@ -120,12 +123,12 @@ def main():
                         "scalar_risk": ["--risk-mode", "scalar"], "llm_compare": ["--no-det-compare"]})
     for name, extra in systems.items():
         trace = f"{out}/trace_{name}.jsonl"
-        if todo(trace):
+        if args.force or not done(trace):
             run(ctrl + extra + ["--out", trace], f"{out}/log_{name}.txt", trace)
         runs[name] = trace
     if not args.skip_baseline:
         trace = f"{out}/trace_baseline.jsonl"
-        if todo(trace):
+        if args.force or not done(trace):
             run(["evidence.baseline", "--obligations", obl, "--n", str(n), "--short",
                  "--concurrency", str(args.concurrency), "--out", trace] + srch + llm, f"{out}/log_baseline.txt", trace)
         runs["baseline"] = trace
