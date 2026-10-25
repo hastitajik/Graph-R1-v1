@@ -195,5 +195,25 @@ class Ablations(unittest.TestCase):
         self.assertEqual(C.Episode(st, "q", None, args, C.Weights()).p("Diversify"), 0.25)
 
 
+class Baseline(unittest.TestCase):
+    def test_agent_loop_searches_then_answers(self):
+        from evidence import baseline as B
+        replies = iter(["<think>x</think>\n<query>\nDirector of F\n", "<think>y</think>\n<answer>\nAnna Berg\n</answer>"])
+
+        async def create(**kw):
+            msg = types.SimpleNamespace(content=next(replies))
+            return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+
+        client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create)))
+        orig = B.retrieve_sync
+        B.retrieve_sync = lambda url, q, **k: [{"<knowledge>": "Anna Berg directed F", "<coherence>": 0.9}]
+        try:
+            args = types.SimpleNamespace(model="m", search_url="x", max_turns=4, info_chars=1000, short=False)
+            r = asyncio.run(B.run_one(client, args, {"question": "Who directed F?", "gold": ["Anna Berg"]}))
+        finally:
+            B.retrieve_sync = orig
+        self.assertEqual((r["answer"], r["em"], r["searches"], r["turns"]), ("Anna Berg", 1.0, 1, 2))
+
+
 if __name__ == "__main__":
     unittest.main()
