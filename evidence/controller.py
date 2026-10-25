@@ -50,7 +50,7 @@ import json
 import math
 import re
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from openai import AsyncOpenAI
 
@@ -83,6 +83,9 @@ class Weights:
     stall_limit: int = 3
     novelty_limit: int = 2
     max_queries: int = 2      # queries per search action
+    learn_p: bool = False     # carry the success counts of each action kind over to the next questions
+    disabled: tuple = ()      # action kinds switched off (ablations)
+    seen: dict = field(default_factory=lambda: {})  # kind -> [successes, attempts] over all questions
 
 
 # ------------------------------------------------------------------ query builders
@@ -200,6 +203,9 @@ class Episode:
     # ---- probabilities, costs
     def p(self, kind):
         s, a = self.stats[kind]
+        if self.W.learn_p:
+            gs, ga = self.W.seen.get(kind, (0, 0))
+            s, a = s + gs, a + ga
         return (s + self.W.prior_succ) / (a + self.W.prior_att)
 
     def price(self, a: Action):
@@ -297,7 +303,7 @@ class Episode:
                 if det or mode:
                     acts.append(Action("Challenge", oid, det, mode, W.conflict if own_conflict else W.challenge,
                                        "conflict" if own_conflict else "confirmation bias"))
-        return [self.price(a) for a in acts]
+        return [self.price(a) for a in acts if a.kind not in self.W.disabled]
 
     # ---- execution
     async def verify(self, oid):
@@ -374,6 +380,9 @@ class Episode:
         improved = pareto_improves(before, after.vector)
         self.stats[a.kind][1] += 1
         self.stats[a.kind][0] += int(improved)
+        g = self.W.seen.setdefault(a.kind, [0, 0])
+        g[1] += 1
+        g[0] += int(improved)
         rec["improved"] = improved
         rec["vector"] = [round(x, 3) for x in after.vector]
         if a.kind != "Verify":
@@ -408,9 +417,24 @@ class Episode:
 
 
 # ------------------------------------------------------------------ one question
+def answer_grounded(state, ans):
+    """A certificate covers the ANSWER, so the answer must come out of the certified evidence."""
+    a = norm(ans or "")
+    if not a or a == "notfound":
+        return False, "no answer from the evidence"
+    if state.obs[state.answer_id]["kind"] != "retrieve":
+        return True, ""  # a derived answer (comparison, yes/no) has no single value to match
+    vals = [norm(v) for v in state.all_values().values() if v]
+    texts = " ".join(norm(it.text) for k in state.live_support(state.answer_id) for it in [state.items[k]])
+    if any(a in v or v in a for v in vals if v) or a in texts:
+        return True, ""
+    return False, "answer is not grounded in the certified evidence"
+
+
 async def solve(client, args, prov, rec, W=None):
     W = W or Weights()
     state = EvidenceState(rec["obligations"], prov)
+    state.question = rec["question"]
     ep = Episode(state, rec["question"], client, args, W)
     stop, cert = await ep.run()
 
@@ -423,6 +447,11 @@ async def solve(client, args, prov, rec, W=None):
         ans, ans_err = await answer_question(client, args.model, state, rec["question"])
         ep.n_llm += 1
     em, f1 = em_f1(ans, gold)
+    grounded, why = answer_grounded(state, ans)
+    certified = cert.complete and (grounded or abstained)
+    cert_d = cert.to_dict()
+    if cert.complete and not certified:
+        cert_d["reasons"] = list(cert_d.get("reasons", [])) + [why]
 
     pathologies = {k: v for k, v in ep.flags_seen.items()}
     if uncovered and ans:
@@ -436,7 +465,7 @@ async def solve(client, args, prov, rec, W=None):
     return {
         "answer": ans, "answer_error": ans_err, "em": em, "f1": f1,
         "question": rec["question"], "gold": gold, "coverage": cert.coverage, "stop": stop,
-        "certified": cert.complete, "certificate": cert.to_dict(), "abstained": abstained,
+        "certified": certified, "certificate": cert_d, "abstained": abstained,
         "answered_from_incomplete": bool(uncovered) and not abstained,
         "uncovered": uncovered, "pathologies": pathologies,
         "searches": ep.n_search, "llm_calls": ep.n_llm,
@@ -506,6 +535,9 @@ async def main():
     ap.add_argument("--model", default=LLM_MODEL, help="LLM name (or EVIDENCE_LLM_MODEL)")
     ap.add_argument("--abstain-uncertified", action="store_true",
                     help="empty answer when the certificate is not complete (default: answer anyway, flagged)")
+    ap.add_argument("--learn-p", action="store_true",
+                    help="keep per-action success counts across questions (use with --concurrency 1)")
+    ap.add_argument("--disable", default="", help="comma list of action kinds to switch off, e.g. Diversify,Verify")
     ap.add_argument("--out", default="trace_ctrl.jsonl")
     ap.add_argument("--show", action="store_true")
     for f in ("gap", "conflict", "challenge", "fragile", "unverified", "c_search", "c_llm", "prior_succ", "prior_att"):
@@ -515,7 +547,8 @@ async def main():
     args = ap.parse_args()
     if not args.search_url:
         ap.error("--search-url (or EVIDENCE_SEARCH_URL) is required")
-    W = replace(d, **{f: getattr(args, f"w_{f}") for f in ("gap", "conflict", "challenge", "fragile", "unverified",
+    W = replace(d, learn_p=args.learn_p, disabled=tuple(k for k in args.disable.split(",") if k),
+                **{f: getattr(args, f"w_{f}") for f in ("gap", "conflict", "challenge", "fragile", "unverified",
                                                           "c_search", "c_llm", "prior_succ", "prior_att")},
                 **{f: getattr(args, f) for f in ("stall_limit", "novelty_limit", "max_queries")})
 

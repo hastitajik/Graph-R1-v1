@@ -205,6 +205,7 @@ async def answer_question(client, model, state, question):
 
 async def solve(client, args, prov, rec):
     state = EvidenceState(rec["obligations"], prov)
+    state.question = rec["question"]
     log, stop = [], "max_rounds"
     for rnd in range(1, args.max_rounds + 1):
         targets = [o for o in state.order if state.is_retrieve(o) and not state.covered(o)
