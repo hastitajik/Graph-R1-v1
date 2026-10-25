@@ -209,12 +209,25 @@ def load_questions(path: str, key: str):
     return data
 
 
+def excluded_questions(paths):
+    """Questions (stripped) found in jsonl files that have a "question" field."""
+    out = set()
+    for p in paths:
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    out.add(json.loads(line)["question"].strip())
+    return out
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--key", default="question")
     ap.add_argument("--n", type=int, default=30)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--exclude", nargs="*", default=[],
+                    help="obligations_*.jsonl files whose questions must NOT be sampled again (held-out set)")
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--out", default="obligations_sample.jsonl")
     ap.add_argument("--api-base", default=BASE_URL)
@@ -222,6 +235,12 @@ async def main():
     args = ap.parse_args()
 
     data = load_questions(args.input, args.key)
+    if args.exclude:
+        # keep a held-out set disjoint from the questions the guards were tuned on
+        skip = excluded_questions(args.exclude)
+        before = len(data)
+        data = [d for d in data if d[args.key].strip() not in skip]
+        print(f"--exclude: dropped {before - len(data)} of {before} questions already used")
     random.Random(args.seed).shuffle(data)
     data = data[: args.n]
 
