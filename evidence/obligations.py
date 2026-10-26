@@ -26,7 +26,7 @@ VALID_TYPES = {"compositional", "comparison", "inference", "bridge_comparison", 
 VALID_KINDS = {"retrieve", "derive"}
 # 'film Blue River' / 'the album "X"': the type word right before a name must survive in the obligations
 TYPE_WORDS = ("film|movie|album|song|band|village|river|company|novel|book|city|town|"
-              "county|series|magazine|newspaper|university|school|ship|opera|play")
+              "county|magazine|newspaper|university|opera")
 TYPE_BEFORE_NAME = re.compile(rf"\b({TYPE_WORDS})\s+(?=[A-Z\"'(])")
 
 SYSTEM_PROMPT = """You decompose a multi-hop question into EVIDENCE OBLIGATIONS.
@@ -144,6 +144,18 @@ def validate(obj: dict, question: str = None, check_types: bool = True) -> list:
         errs.append("answer_id not in obligations")
     if not any(o.get("kind") == "retrieve" for o in obs):
         errs.append("no retrieve obligation")
+    elif obj.get("answer_id") in ids:
+        # the answer must rest on at least one fact that is retrieved, not only on derive steps
+        by_id = {o["id"]: o for o in obs}
+        seen, stack = set(), [obj["answer_id"]]
+        while stack:
+            i = stack.pop()
+            if i in seen or i not in by_id:
+                continue
+            seen.add(i)
+            stack.extend(d for d in by_id[i].get("depends_on", []) if isinstance(d, str))
+        if not any(by_id[i].get("kind") == "retrieve" for i in seen):
+            errs.append("the answer obligation depends on no retrieve obligation")
 
     # cycle check (DFS)
     graph = {o["id"]: [d for d in o.get("depends_on", []) if d in ids] for o in obs}

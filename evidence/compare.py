@@ -64,8 +64,15 @@ def mcnemar_exact(b, c):
 def paired(ref, other, boots=2000, seed=0):
     """Per-question comparison on the questions both runs answered: wins / losses of `other` against `ref`,
     exact McNemar p and a bootstrap 95% interval of the EM difference (other - ref)."""
-    a = {r["question"]: r["em"] for r in ref}
-    pairs = [(a[r["question"]], r["em"]) for r in other if r["question"] in a]
+    def keyed(rs):      # a question that occurs twice is matched occurrence by occurrence
+        seen, out = {}, {}
+        for r in rs:
+            n = seen[r["question"]] = seen.get(r["question"], 0) + 1
+            out[(r["question"], n)] = r["em"]
+        return out
+
+    a, b = keyed(ref), keyed(other)
+    pairs = [(a[k], b[k]) for k in b if k in a]
     if not pairs:
         return None
     wins = sum(1 for x, y in pairs if y > x)
@@ -141,6 +148,9 @@ def report(runs, ref=None, rejected=False):
                     if "verify_rejected" in st:
                         v = st["verify_rejected"]
                         out.append(f"- {n_} | EM={int(r['em'])} | {r['question'][:60]} | fact: {v['fact']} | passage: {v['passage'][:140]}")
+    if len({len(v) for v in runs.values()}) > 1:
+        out += ["", "WARNING: the runs have different numbers of questions " +
+                str({k: len(v) for k, v in runs.items()}) + "; the per-question table is cut to the shortest."]
     n = min(len(v) for v in runs.values())
     keyed = {k: {r["question"]: r for r in v} for k, v in runs.items()}
     qs = [r["question"] for r in next(iter(runs.values()))][:n]

@@ -14,8 +14,8 @@ variable and agreeing with the chosen value of the obligation's own variables.
 Evidence cut
     An obligation is supported if some item reaches it AND that item still has a provenance unit.
     kappa_i   = number of independent provenance units behind obligation i (0 = missing,
-                1 = single point of failure, >= 2 = robust). UNKNOWN counts once and is never
-                counted as independent in D (see d_prov).
+                1 = single point of failure, >= 2 = robust). Passages that share an article title are one unit;
+                UNKNOWN counts (once) only when no passage with a known title supports the fact.
     A "critical cut" is a unit whose removal leaves some required obligation unsupported.
     audit() computes kappa and the cuts on the GRAPH and cross-checks them against the state
     (tests/test_evidence_offline.py asserts both agree).
@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 
 import networkx as nx
 
-from evidence.state import NO_DROP, UNKNOWN
+from evidence.state import NO_DROP, UNKNOWN, EvidenceState
 
 DEPENDS, SUPPORTS, FROM = "depends", "supports", "from"
 
@@ -79,7 +79,7 @@ def graph_units(G, oid):
     for i in G.predecessors(node):
         if i[0] == "i":
             units |= {u[1] for u in G.predecessors(i) if u[0] == "u"}
-    return units
+    return EvidenceState.effective_units(units)   # UNKNOWN is not an independent unit next to a known one
 
 
 def graph_critical_cuts(G, oids):
@@ -154,7 +154,7 @@ class Certificate:
     uncovered: list          # required retrieve obligations without live support
     blocked: list            # subset of `uncovered` that cannot even be searched yet (upstream unbound)
     connected: bool
-    kappa: dict              # oid -> number of units (UNKNOWN counts once)
+    kappa: dict              # oid -> number of independent units (UNKNOWN only when nothing is known)
     critical: list           # [{"oid", "unit", "verified"}] single points of failure
     unaudited: list          # oids in `critical` whose sole passage was not verified yet
     conflicts: list
@@ -199,6 +199,8 @@ def audit(state):
     vector = (coverage, r_struct, d_prov, -float(len(unresolved)))
 
     reasons = []
+    if not req:
+        reasons.append("the answer depends on no retrieve obligation (nothing to support it)")
     if uncovered:
         reasons.append(f"uncovered obligations: {', '.join(uncovered)}")
     if not connected and not uncovered:

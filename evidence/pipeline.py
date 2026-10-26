@@ -7,7 +7,7 @@ Steps (each is skipped when its output already exists, unless --force):
   1. provenance index   (python3 -m evidence.provenance build)
   2. obligations        (python3 -m evidence.obligations)            -> <out-dir>/obligations.jsonl
   3. controller         (python3 -m evidence.controller)             -> <out-dir>/trace_controller.jsonl
-  4. ablations          (--ablations: no Diversify / Verify / Bridge / Challenge, only FillGap, no fragility term,
+  4. ablations          (--ablations: no Diversify / Verify / Bridge / Challenge, only FillGap, no fragility term, per-question p,
                         guards off, naive provenance, scalar risk, LLM comparison)
   5. baseline           (python3 -m evidence.baseline --short)       -> <out-dir>/trace_baseline.jsonl
   6. report             (python3 -m evidence.compare)                -> <out-dir>/report.md
@@ -125,7 +125,7 @@ def main():
                         "naive_provenance": ["--unit", "passage"],
                         "scalar_risk": ["--risk-mode", "scalar"], "llm_compare": ["--no-det-compare"],
                         "fillgap_only": ["--disable", "Diversify,Bridge,Challenge,Verify"],
-                        "no_fragility": ["--w-fragile", "0"],
+                        "no_fragility": ["--w-fragile", "0"], "no_learn_p": ["--no-learn-p"],
                         "no_guards": ["--env", "EVIDENCE_SELF_CHECK=0", "--env", "EVIDENCE_SUBJECT_CHECK=0"]})
     for name, extra in systems.items():
         trace = f"{out}/trace_{name}.jsonl"

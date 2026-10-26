@@ -1,0 +1,161 @@
+% Evidence-Certificate GraphRAG: method section for the Graph-R1 paper.
+% Compile standalone:  latexmk -pdf evidence_certificate.tex
+% To include in the paper, copy everything between \begin{document} and \end{document} (or \input it).
+% Every definition below is the one implemented in evidence/*.py (file names are given in the text).
+\documentclass[10pt]{article}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb,booktabs,algorithm,algpseudocode,enumitem,xcolor}
+\newcommand{\Risk}{\mathrm{Risk}}
+\newcommand{\VNE}{\mathrm{VNE}}
+\newcommand{\GE}{G_E}
+\newcommand{\GH}{G_H}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\begin{document}
+
+\section{Evidence-Certificate Reasoning on the Knowledge Hypergraph}
+\label{sec:evidence}
+
+Graph-R1 trains an agent with reinforcement learning to query the knowledge hypergraph $\GH$ and to
+decide when it knows enough. Its stopping decision is made by the policy itself, so an answer carries
+no statement of \emph{what evidence supports it} and the agent cannot tell a lucky guess from a fact that is
+documented. We add a \emph{training-free} layer on top of the unchanged $\GH$ and the unchanged dual-path
+retrieval API. A frozen LLM (no gradient update) is used only to (i) decompose the question and (ii) match
+passages to facts. Everything that decides \emph{which evidence to buy next} and \emph{when to stop} is an explicit,
+inspectable procedure over an \emph{evidence support graph}, and the output is an \emph{evidence certificate}.
+
+\paragraph{Overview.} For a question $q$ the system runs the loop
+\[
+q \;\to\; \mathcal O(q) \;\to\; \text{evidence state } s_t \;\to\; \text{audit}(s_t) \;\to\; \text{controller} \;\to\; \text{retrieval on }\GH \;\to\; s_{t+1}\;\ldots\;\to\; (a,\text{cert}).
+\]
+
+\subsection{Evidence obligations}
+The LLM maps $q$ to a set $\mathcal O(q)=\{o_1,\dots,o_n\}$, $n\le 6$ (one call, temperature $0$, strict JSON, up to three
+validated attempts; \texttt{obligations.py}). An obligation $o_i=(\tau_i,\ \mathrm{dep}_i,\ \kappa_i)$ is an atomic statement $\tau_i$ with
+unknown variables $?X$, a dependency list $\mathrm{dep}_i\subseteq\mathcal O$ and a kind
+$\kappa_i\in\{\textsf{retrieve},\textsf{derive}\}$. A \textsf{retrieve} obligation has to be stated by a document of the
+corpus; a \textsf{derive} obligation (compare two dates, same country?) is computed from the values of others and needs no retrieval.
+One designated obligation $o_{\mathrm{ans}}$ produces the answer. The dependencies form a DAG (cycles are rejected). Validation also
+requires: every variable is introduced by exactly one obligation (otherwise values of unrelated unknowns would merge); every
+parenthesised qualifier of the question and the type word of a named entity (\emph{film}, \emph{album}, \dots) survive in the obligations; and
+$o_{\mathrm{ans}}$ depends, directly or not, on at least one \textsf{retrieve} obligation. Let $R\subseteq\mathcal O$ be the required
+\textsf{retrieve} obligations (the ancestors of $o_{\mathrm{ans}}$ of kind \textsf{retrieve}).
+
+\subsection{Evidence state and provenance}
+The state $s$ holds the retrieved passages (items), for each obligation the set of items that \emph{support} it with the variable
+bindings the matcher extracted, and the values of the variables inherited at match time. A match is accepted only if all of these hold
+(\texttt{state.validate\_match}): the quoted words occur in the passage (at least 10 normalised characters); every bound value occurs in the passage;
+the value has the type its slot asks for (a date for \emph{born on}, not a date for \emph{born in} when the question asks \emph{where});
+the value is not the entity the question is about nor equal to the value it was derived from (``the father of $X$ is $X$''); and the passage is
+about the entity the chain arrived at (subject check). The matcher also receives the question, so that passages about a same-named entity of
+another kind (an album and a film) are rejected.
+
+\paragraph{Provenance unit.} The independence of two sources is judged on the \emph{article} they come from, not on the passage
+(\texttt{provenance.py}): each passage is mapped back, through the chunk store of the graph, to the title(s) of the article it was extracted from.
+Passages that share a title are \emph{one} unit (union--find over titles). A passage whose article is unknown is not an independent source: it counts
+only if nothing with a known title supports the fact. For a variable $?X$ the \emph{chosen value} is the supported value with the most
+independent units (ties by retrieval coherence); alias forms of one name (``Annakin'', ``Ken Annakin'') are one value, regnal numbers, place suffixes
+(``of Wales''/``of Prussia'') and parenthesised qualifiers keep entities apart. A support entry is \emph{live} if it was matched under the
+\emph{current} values of the inherited variables, agrees with the chosen value of the obligation's own variables, and its unit is not removed.
+
+\subsection{Evidence support graph and audit}
+The evidence support graph $\GE=(V,E)$ is a typed, directed graph with nodes for required obligations, live items and provenance units,
+and edges \emph{depends} ($o_j\!\to\! o_i$ for $o_j\in\mathrm{dep}_i$), \emph{supports} (item $\to$ obligation) and \emph{from} (unit $\to$ item).
+For $o\in R$ let $U(o)$ be the set of independent units connected to $o$ and $\mathrm{k}(o)=|U(o)|$ ($=0$ if uncovered).
+\begin{itemize}[leftmargin=1.2em,itemsep=1pt]
+ \item \textbf{Coverage} $C=\frac1{|R|}\,|\{o\in R:\mathrm{k}(o)\ge1\}|$.
+ \item \textbf{Critical cuts.} A unit $u$ is a cut if $U(o)=\{u\}$ for some $o\in R$ (its removal disconnects $o$ from all evidence). A cut is
+  \emph{audited} once the Verify action confirmed that its sole passage states the fact (see below).
+ \item \textbf{Robustness} $R_{\mathrm{rob}}=\frac{|\{o \text{ covered}: \mathrm{k}(o)\ge2\ \vee\ o\text{ audited}\}|}{|\{o\text{ covered}\}|}$.
+ \item \textbf{Provenance diversity} $D=\frac1{|R|}|\{o\in R: \text{at least two known units}\}|$.
+ \item \textbf{Conflicts.} A variable with several supported values is in conflict; it is \emph{resolved} iff the best value has strictly more known
+  independent units than the runner-up. $X$ is the number of unresolved conflicts.
+ \item \textbf{Counterfactual fragility.} For every unit $u$ the state is recomputed without $u$; $u$ is fragile if some obligation becomes uncovered
+  or the chosen value of a variable changes. The list is reported in the certificate and drives the Diversify gain.
+\end{itemize}
+The \emph{state vector} is $\mathbf v(s)=(C,\ R_{\mathrm{rob}},\ D,\ -X)$; a step \emph{improves} the state if no component decreases and one increases (Pareto
+test). A scalar alternative is $\Risk(s)=(1-C)+\lambda_X X+\lambda_R(1-R_{\mathrm{rob}})$ ($\lambda_X=\lambda_R=0.5$). A step that \emph{discovers} a conflicting value
+(Diversify, Challenge) is counted as a success although $X$ grows, because that evidence is what the audit needs.
+
+\paragraph{Certificate.} $\mathrm{Cert}(s)$ is \emph{complete} iff (i) $R\neq\emptyset$ and every $o\in R$ is covered, (ii) the support graph over the required
+obligations is connected, (iii) no conflict is unresolved, (iv) every critical cut is audited. A complete certificate is attached to the answer only if, in
+addition, the \emph{answer is grounded}: for a \textsf{retrieve} answer the answer string must be (an alias of) the chosen value of the answer
+obligation's own variable, or occur verbatim in a passage supporting it (a value that belongs to another obligation does not count); for a \textsf{derive}
+answer it must be \emph{computed} (below) or one of the options named in the question, or yes/no. The certificate records the basis (\emph{retrieved},
+\emph{computed}, \emph{option}, \emph{yes/no}); only the first two check the final step against the evidence, the last two certify the facts and leave the
+comparison to the LLM. Model confidence plays no role anywhere.
+
+\paragraph{Deterministic comparison.} For ``which of $A$ or $B$ \ldots earlier/later'' questions with two date variables, the last step is computed, not
+generated (\texttt{derive.py}): each date is traced back along the obligation chain to the option it belongs to, dates are compared at the coarsest
+shared precision, and the function returns nothing (the LLM answer is kept) if the options, the direction or a tie are ambiguous.
+
+\subsection{Decision-time controller}
+Each step the controller enumerates the applicable actions, prices them, and executes the one with the best \emph{value of next evidence}
+\[
+\VNE(a\mid s)\;=\;p_a\cdot g_a\;-\;\mathrm{cost}(a),\qquad \mathrm{cost}(a)=c_s\,n_{\mathrm{search}}(a)+c_\ell\,n_{\mathrm{llm}}(a).
+\]
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}p{1.5cm}p{3.7cm}p{6.6cm}p{3.1cm}@{}}\toprule
+action & applicable when & what it does & gain $g_a$\\ \midrule
+FillGap & required $o$ uncovered and ready & search its fact (plain query, compact form, entity form, LLM paraphrase, then up to 2 \emph{informed} LLM queries that read the retrieved titles) & $w_{gap}(1+\#\text{blocked descendants})$\\
+Bridge & upstream hop of $o$ cannot be found & search the chain as one query and the whole question & $w_{gap}(1+\cdot)$\\
+Diversify & $o$ covered with $<2$ known units, or tied conflict & search a second article stating the fact (one query) & $w_{fragile}$ / $w_{conflict}$\\
+Challenge & conflict, or confirmation bias & search for passages contradicting the chosen value & $w_{conflict}$ / $w_{chal}$\\
+Verify & critical cut not audited & re-check the sole passage with a stricter LLM prompt; remove the support if it fails (no search) & $w_{unver}$\\
+Answer & no action with $\VNE>0$ & stop & --\\ \bottomrule
+\end{tabular}
+\end{table}
+$p_a$ is the estimated success probability of the action kind, $p_a=(s_a+\alpha_0)/(n_a+\alpha_0+\beta_0)$ with a Beta prior ($\alpha_0=1,\beta_0=3$, $p_0=0.25$) and
+success meaning a Pareto improvement. The counts $(s_a,n_a)$ are carried over the questions of a run, so an optional action that does not pay on the corpus
+is dropped automatically; FillGap and Verify never fall below the prior (a certificate needs them) and a conflict-driven Diversify keeps its own counts.
+The gains only fix an order of importance (gap $>$ conflict $>$ challenge $>$ fragile $>$ unverified) and are \emph{not} an exact expected risk reduction; the
+Pareto test decides success. Defaults: $w_{gap}=1,\ w_{conflict}=0.8,\ w_{chal}=0.2,\ w_{fragile}=0.3,\ w_{unver}=0.15,\ c_s=0.05,\ c_\ell=0.02$.
+For every executed step we also log the shaped reward $r=\Delta C+\alpha\Delta R_{\mathrm{rob}}+\beta\Delta D-\gamma\Delta X-\lambda\,\mathrm{cost}$
+($\alpha=\beta=\gamma=0.5,\ \lambda=1$). It is a diagnostic: the controller is training-free and no policy is optimised on it.
+
+\paragraph{Reasoning-pathology monitor.} (i) \emph{retrieval loop}: three consecutive search steps without a new passage or a Pareto gain stop the search;
+(ii) \emph{over-retrieval}: two searches for an obligation without a new passage close it; (iii) \emph{confirmation bias}: every covered obligation rests on one known
+article and nothing was challenged, so Challenge is allowed for the weakest one; (iv) \emph{premature confidence}: an answer produced while a required obligation is uncovered;
+(v) \emph{ungrounded answer}: the answer occurs in none of the evidence; (vi) \emph{derive mismatch}: the LLM's comparison disagrees with the computed one.
+(i)--(iii) act on the control flow, (iv)--(vi) are reported.
+
+\paragraph{Stopping.} The loop ends when the certificate is complete and no action has $\VNE>0$ (\emph{certified}), when no action has $\VNE>0$ but the
+certificate is incomplete, when upstream hops are blocked, on a retrieval loop, or when the search budget (10 queries) or the step budget (12) is exhausted.
+An uncertified question is still answered (flagged) so that EM can be reported both ways; \texttt{--abstain-uncertified} refuses instead.
+
+\begin{algorithm}[h]\caption{Evidence-certificate controller for one question}\small
+\begin{algorithmic}[1]
+\State $\mathcal O\gets\textsc{Decompose}(q)$; $s\gets\textsc{InitState}(\mathcal O)$
+\For{$t=1\ldots T_{\max}$}
+ \State \textsc{Sweep}: show held, unchecked passages to the matcher for obligations that just became ready
+ \State $\mathrm{cert}\gets\textsc{Audit}(s)$; $\mathrm{flags}\gets\textsc{Monitor}(s)$
+ \If{flags.retrieval\_loop} \textbf{break} \EndIf
+ \State $\mathcal A\gets\textsc{Propose}(s,\mathrm{cert},\mathrm{flags})$; $a^\star\gets\arg\max_{a\in\mathcal A}\VNE(a)$
+ \If{$\mathcal A=\emptyset$ \textbf{or} $\VNE(a^\star)\le0$ \textbf{or} budget exceeded} \textbf{break} \EndIf
+ \State execute $a^\star$ (search $\GH$ / verify), match new passages, update $s$; update $p_{a^\star}$ with the Pareto test
+\EndFor
+\State $a\gets\textsc{Answer}(s)$ (computed for date comparisons, otherwise from the established facts)
+\State \Return $a$, $\mathrm{Cert}(s)$, certified $\;=\;\mathrm{Cert}$ complete $\wedge$ answer grounded
+\end{algorithmic}\end{algorithm}
+
+\subsection{Implementation details and cost}
+The hypergraph, the embeddings and the dual-path retrieval (entity and hyperedge, rank fusion) are used through the existing \texttt{/search} API
+without change. One matcher call sees at most 10 passages of at most 700 characters. The audit is polynomial (graph of $O(n+|\text{items}|)$ nodes; fragility
+recomputes the state once per unit). Per question the controller issues at most 10 retrieval queries and, in our runs, about 10 LLM calls (decomposition, matching, verification,
+query writing, answer). All thresholds above are hyper-parameters on the command line.
+
+\subsection{Assumptions and limits}
+(1) A fact of the corpus is traceable to a source article; the provenance index is built from the graph's chunk store and an item without a title is never counted as independent
+(the controller warns when most supporting passages have no title). (2) Type cues, date parsing and name aliases are English; the matcher and obligation prompts are not
+dataset-specific but were tuned on 2WikiMultiHopQA. (3) The certificate covers retrieved facts; it cannot detect a passage about a different entity with the same name
+unless the question or the chain disambiguates it, and the final comparison is computed only for dates. (4) Independent second sources are rare in 2WikiMultiHopQA, so $D$ stays low there. (5) The value
+of next evidence is an estimate with hand-set gains, not an exact expected risk reduction.
+
+\subsection{Experimental protocol}
+\textbf{Systems} (same frozen LLM, same retrieval API, same questions): the Graph-R1 agent loop without RL (baseline), the controller, and ablations: without Diversify, Verify, Bridge, Challenge;
+FillGap only; without the fragility term; guards off; every passage independent (naive provenance); scalar risk; LLM comparison; per-question $p$.
+\textbf{Metrics}: EM, F1, retrieval queries and LLM calls per question; the share of certified answers; EM on certified and uncertified answers; selective EM
+(answer only when certified, abstention counts as wrong). \textbf{Statistics}: Wilson 95\% intervals; paired wins/losses against a reference, exact McNemar and a bootstrap interval of the EM difference
+(\texttt{evidence/compare.py}). \textbf{Data}: a development set on which the guards were tuned and a disjoint held-out set (\texttt{--exclude}).
+\todo{insert final table from runs/final/report.md}
+
+\end{document}
