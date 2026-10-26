@@ -12,7 +12,9 @@ Loop (one question):
 
 Actions
     FillGap   obligation uncovered and ready      search its fact (plain query; then compact form,
-                                                  entity-only form, then LLM paraphrases)
+                                                  entity-only form, one blind LLM paraphrase, then up to
+                                                  two INFORMED LLM queries that read the passages retrieved
+                                                  so far)
     Bridge    obligation blocked because the      search the chain as ONE query ("mother of the
               upstream hop cannot be found        director of X") and the whole question
     Diversify covered with < 2 independent        search for a SECOND article stating the fact
@@ -25,8 +27,11 @@ Actions
 VNE
     gain   = Weights.<tier> (x1 + number of blocked descendants for gap actions)
     cost   = c_search * #queries + c_llm * #LLM-query calls
-    p      = (successes + prior_succ) / (attempts + prior_att), per action kind and per question;
-             a step succeeds when the audit vector (C, R, D, -X) Pareto-improves.
+    p      = (successes + prior_succ) / (attempts + prior_att), per action kind; by default the counts are
+             carried over the questions of the run (--no-learn-p: per question), so an optional action that
+             never pays (Diversify on a corpus with one article per fact) is dropped. FillGap and Verify
+             never fall below the prior: a certificate needs them. A Diversify that resolves a tied conflict
+             keeps its own counts. A step succeeds when the audit vector (C, R, D, -X) Pareto-improves.
     The tier weights are hyper-parameters (Weights, all on the command line). They only fix an
     ORDER of importance (gap > conflict > challenge > fragile > unverified); the Pareto test is
     what decides whether a step made progress. Ablate them.
@@ -56,16 +61,17 @@ from openai import AsyncOpenAI
 
 from evidence.audit import audit, pareto_improves, required_retrieve, risk
 from evidence.common import LLM_BASE_URL, LLM_MODEL, SEARCH_URL
-from evidence.derive import derive_answer
+from evidence.derive import derive_answer, question_options
 from evidence.metrics import em_f1
 from evidence.obligations import extract_json
 from evidence.provenance import ProvenanceIndex, norm
 from evidence.run_mvp import (MAP_BATCH, PASSAGE_CHARS, answer_question, make_query, map_and_apply,
                               parse_results, retrieve_sync)
-from evidence.state import MIN_QUOTE, UNKNOWN, EvidenceState
+from evidence.state import MIN_QUOTE, UNKNOWN, EvidenceState, same_entity
 
 SEARCH_KINDS = ("FillGap", "Bridge", "Diversify", "Challenge")
 KINDS = SEARCH_KINDS + ("Verify",)
+ESSENTIAL = ("FillGap", "Verify")   # their success rate is never allowed to fall below the prior
 STOP_WORDS = {"the", "a", "an", "of", "is", "was", "were", "are", "be", "been", "in", "on", "at", "by",
               "to", "for", "did", "does", "do", "has", "have", "had", "that", "which", "who"}
 
@@ -216,6 +222,12 @@ class Action:
     n_search: int = 0
     limit: int = 0            # max queries this action may send (0 = Weights.max_queries)
 
+    @property
+    def stat(self):
+        """Statistics key: a Diversify that resolves a tied conflict is a different bet from one that looks for a
+        second source of an unchallenged fact, so each learns its own success rate."""
+        return "Diversify/conflict" if self.kind == "Diversify" and self.why == "tied conflict" else self.kind
+
 
 class Episode:
     def __init__(self, state, question, client, args, W: Weights):
@@ -223,6 +235,7 @@ class Episode:
         self.stats = {k: [0, 0] for k in KINDS}     # kind -> [successes, attempts]
         self.banned, self.dead, self.llm_used = set(), set(), set()
         self.zero_novelty = Counter()
+        self.search_errors = Counter()
         self.challenged = False
         self.stall = 0
         self.n_search = self.n_llm = 0
@@ -242,14 +255,17 @@ class Episode:
     def p(self, kind):
         # with learn_p the run-wide counter W.seen already contains the attempts of THIS question
         # (execute() updates both), so it replaces the per-question counter instead of being added to it
-        s, a = self.W.seen.get(kind, (0, 0)) if self.W.learn_p else self.stats[kind]
-        return (s + self.W.prior_succ) / (a + self.W.prior_att)
+        s, a = self.W.seen.get(kind, (0, 0)) if self.W.learn_p else self.stats.get(kind, (0, 0))
+        p = (s + self.W.prior_succ) / (a + self.W.prior_att)
+        if kind in ESSENTIAL:   # a certificate needs them: bad luck on earlier questions must not switch them off
+            p = max(p, self.W.prior_succ / self.W.prior_att)
+        return p
 
     def price(self, a: Action):
         a.n_search = 0 if a.kind == "Verify" else min(a.limit or self.W.max_queries,
                                                       len(a.det) + (2 if a.llm_mode else 0))
         a.cost = self.W.c_search * a.n_search + self.W.c_llm * (1 if a.llm_mode or a.kind == "Verify" else 0)
-        a.p = self.p(a.kind)
+        a.p = self.p(a.stat)
         a.vne = a.p * a.gain - a.cost
         return a
 
@@ -408,8 +424,12 @@ class Episode:
                 try:
                     res = parse_results(await asyncio.to_thread(retrieve_sync, self.args.search_url, q))
                 except Exception as e:
+                    # a failed search says nothing about the query: it is NOT marked as tried, and it does not
+                    # count as a stalled step; after repeated failures the obligation is given up
                     rec.setdefault("errors", []).append(f"{type(e).__name__}: {e}"[:150])
-                    S.note_query(a.oid, q)
+                    self.search_errors[a.oid] += 1
+                    if self.search_errors[a.oid] >= 3:
+                        self.dead.add(a.oid)
                     continue
                 self.n_search += 1
                 S.note_query(a.oid, q)
@@ -433,16 +453,17 @@ class Episode:
                         self.dead.add(a.oid)
         after = audit(S)
         improved = self.better(before, after.vector, a.kind)
-        self.stats[a.kind][1] += 1
-        self.stats[a.kind][0] += int(improved)
-        g = self.W.seen.setdefault(a.kind, [0, 0])
+        st = self.stats.setdefault(a.stat, [0, 0])
+        st[1] += 1
+        st[0] += int(improved)
+        g = self.W.seen.setdefault(a.stat, [0, 0])
         g[1] += 1
         g[0] += int(improved)
         rec["improved"] = improved
         d = [x - y for x, y in zip(after.vector, before)]   # (dC, dR, dD, -dX)
         rec["reward"] = round(d[0] + W.alpha * d[1] + W.beta * d[2] + W.gamma * d[3] - W.lam_cost * a.cost, 4)
         rec["vector"] = [round(x, 3) for x in after.vector]
-        if a.kind != "Verify":
+        if a.kind != "Verify" and not (rec.get("errors") and not rec["queries"]):
             self.stall = 0 if (improved or new_keys) else self.stall + 1
         self.steps.append(rec)
         return after
@@ -474,18 +495,61 @@ class Episode:
 
 
 # ------------------------------------------------------------------ one question
-def answer_grounded(state, ans):
-    """A certificate covers the ANSWER, so the answer must come out of the certified evidence."""
+def _toks(s):
+    return re.findall(r"\w+", (s or "").lower())
+
+
+def value_match(a, b):
+    """Do two surface forms name the same value? Exact, alias, or token F1 >= 0.6 ('Eton College' ~ 'Eton')."""
+    if not norm(a) or not norm(b):
+        return False
+    if norm(a) == norm(b) or same_entity(a, b):
+        return True
+    ta, tb = set(_toks(a)), set(_toks(b))
+    hit = len(ta & tb)
+    if not hit:
+        return False
+    p, r = hit / len(ta), hit / len(tb)
+    return 2 * p * r / (p + r) >= 0.6
+
+
+def grounding(state, ans, question="", derived=None):
+    """(ok, why, basis). A certificate covers the ANSWER, so the answer must come out of the certified evidence:
+      retrieved  - the answer obligation yields a value and the answer IS that value (or is quoted from the
+                   passages that support it); a value bound for another obligation does not count
+      computed   - a date comparison computed from the certified dates (derive.py)
+      option     - a derive answer that names one of the two options of the question; the facts behind it are
+                   certified, the comparison itself is the LLM's
+      yes/no     - a yes/no derive answer; same remark"""
     a = norm(ans or "")
     if not a or a == "notfound":
-        return False, "no answer from the evidence"
+        return False, "no answer from the evidence", None
     if state.obs[state.answer_id]["kind"] != "retrieve":
-        return True, ""  # a derived answer (comparison, yes/no) has no single value to match
-    vals = [norm(v) for v in state.all_values().values() if v]
-    texts = " ".join(norm(it.text) for k in state.live_support(state.answer_id) for it in [state.items[k]])
-    if any(a in v or v in a for v in vals if v) or a in texts:
-        return True, ""
-    return False, "answer is not grounded in the certified evidence"
+        if derived and norm(derived.get("answer", "")) == a:
+            return True, "", "computed"
+        opts = question_options(question or "") or ()
+        if any(value_match(ans, o) for o in opts):
+            return True, "", "option"
+        if a in ("yes", "no"):
+            return True, "", "yes/no"
+        return False, "derived answer is neither computed nor an option named in the question", None
+    vals = [state.value(v) for v in state.own_vars(state.answer_id)]
+    if any(v and value_match(ans, v) for v in vals):
+        return True, "", "retrieved"
+    own = set(state.own_vars(state.answer_id))
+    others = [state.value(v) for v in state.all_values() if v not in own]
+    if any(o and value_match(ans, o) for o in others):
+        return False, "answer is not grounded: it is the value of another obligation, not of the answer", None
+    if len(a) >= 3:
+        pat = re.compile(r"(?<!\w)" + re.escape((ans or "").strip().lower()) + r"(?!\w)")
+        if any(pat.search(state.items[k].text.lower()) for k in state.live_support(state.answer_id)):
+            return True, "", "retrieved"
+    return False, "answer is not grounded: it is not the value the certified evidence gives", None
+
+
+def answer_grounded(state, ans, question="", derived=None):
+    ok, why, _ = grounding(state, ans, question, derived)
+    return ok, why
 
 
 async def solve(client, args, prov, rec, W=None):
@@ -510,7 +574,7 @@ async def solve(client, args, prov, rec, W=None):
         if derived:
             ans = derived["answer"]
     em, f1 = em_f1(ans, gold)
-    grounded, why = answer_grounded(state, ans)
+    grounded, why, basis = grounding(state, ans, rec["question"], derived)
     certified = cert.complete and (grounded or abstained)
     cert_d = cert.to_dict()
     cert_d["risk"] = round(risk(cert.vector, W.lam_x, W.lam_r), 4)
@@ -534,8 +598,10 @@ async def solve(client, args, prov, rec, W=None):
         "answer": ans, "answer_llm": ans_llm, "derived": derived, "answer_error": ans_err, "em": em, "f1": f1,
         "question": rec["question"], "gold": gold, "coverage": cert.coverage, "stop": stop,
         "certified": certified, "certificate": cert_d, "abstained": abstained,
+        "answer_basis": basis if certified or grounded else None,
         "answered_from_incomplete": bool(uncovered) and not abstained,
         "uncovered": uncovered, "pathologies": pathologies,
+        "unknown_source_rate": unknown_rate(state),
         "searches": ep.n_search, "llm_calls": ep.n_llm,
         "action_stats": {k: {"success": s, "attempts": a} for k, (s, a) in ep.stats.items() if a},
         "steps": ep.steps, "bindings": vals, "conflicts": state.conflicts(), "n_items": len(state.items),
@@ -544,6 +610,13 @@ async def solve(client, args, prov, rec, W=None):
                          "titles": sorted({t for k in state.live_support(o) for t in (state.items[k].titles or [UNKNOWN])})}
                         for o in state.order],
     }
+
+
+def unknown_rate(state):
+    """Share of the supporting passages whose article is unknown. A high value means the provenance index does not
+    fit the corpus (chunk layout, titles): independence then cannot be judged and D / kappa are meaningless."""
+    keys = [k for o in required_retrieve(state) for k in state.live_support(o)]
+    return round(sum(not state.items[k].titles for k in keys) / len(keys), 3) if keys else 0.0
 
 
 def show(r):
@@ -599,6 +672,14 @@ def summary(rs, model):
     if dm:
         bad = [r for r in dm if r["pathologies"].get("derive_mismatch")]
         print(f"computed date comparisons: {len(dm)} | the LLM's own comparison differed in {len(bad)}")
+    basis = Counter(r.get("answer_basis") for r in rs if r["certified"])
+    if basis:
+        print("certified answers by basis:", dict(basis), "(computed / retrieved = checked against the evidence; "
+              "option / yes-no = the facts are certified, the final comparison is the LLM's)")
+    unk = sum(r.get("unknown_source_rate", 0) for r in rs) / max(len(rs), 1)
+    if unk > 0.5:
+        print(f"!! {unk:.0%} of the supporting passages have no known article: the provenance index does not fit this "
+              "corpus, independence (D, kappa, critical cuts) is not meaningful")
     errs = sum(1 for r in rs for s in r["steps"] if s.get("llm_error") or s.get("errors")) + sum(1 for r in rs if r.get("answer_error"))
     if errs:
         print(f"!! {errs} LLM/search call(s) failed - check these results before using them")
@@ -620,8 +701,10 @@ async def main():
                     help="empty answer when the certificate is not complete (default: answer anyway, flagged)")
     ap.add_argument("--no-det-compare", dest="det_compare", action="store_false",
                     help="let the LLM answer date-comparison questions (default: compute them from the certified dates)")
-    ap.add_argument("--learn-p", action="store_true",
-                    help="keep per-action success counts across questions (use with --concurrency 1)")
+    ap.add_argument("--no-learn-p", dest="learn_p", action="store_false",
+                    help="estimate p per question only (default: the success counts of each optional action are "
+                         "carried over to the next questions of the run, so an action that never pays is dropped; "
+                         "with --concurrency > 1 the order of those updates, and so the run, is not bit-reproducible)")
     ap.add_argument("--disable", default="", help="comma list of action kinds to switch off, e.g. Diversify,Verify")
     ap.add_argument("--risk-mode", choices=("pareto", "scalar"), default="pareto",
                     help="how a step is judged: Pareto vector (default) or the scalar Risk of the plan")
@@ -642,7 +725,7 @@ async def main():
         ap.error("--search-url (or EVIDENCE_SEARCH_URL) is required")
     import evidence.state as state_mod
     state_mod.UNIT_MODE = args.unit
-    W = replace(d, alpha=args.r_alpha, beta=args.r_beta, gamma=args.r_gamma, lam_cost=args.r_lam_cost,
+    W = replace(d, seen={}, alpha=args.r_alpha, beta=args.r_beta, gamma=args.r_gamma, lam_cost=args.r_lam_cost,
                 learn_p=args.learn_p, risk_mode=args.risk_mode, lam_x=args.lam_x, lam_r=args.lam_r, disabled=tuple(k for k in args.disable.split(",") if k),
                 **{f: getattr(args, f"w_{f}") for f in ("gap", "conflict", "challenge", "fragile", "unverified",
                                                           "c_search", "c_llm", "prior_succ", "prior_att")},

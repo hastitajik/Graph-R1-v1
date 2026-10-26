@@ -19,7 +19,8 @@ question
 - Provenance unit = Wikipedia article title (`evidence/provenance.py`); an unknown source counts once, never as independent.
 - Guards against wrong evidence (all in `evidence/state.py`): quote must occur in the passage, binding must occur in the
   passage, type check (date vs place), subject check, self-reference check, alias-aware conflicts.
-- A certificate is issued only if the audit passes AND the final answer is grounded in the certified evidence.
+- A certificate is issued only if the audit passes AND the final answer is grounded: a retrieve answer must be the value of the answer obligation itself (a bridge value does not count), a derive answer must be computed, or name an option of the question, or be yes/no (`answer_basis` in the trace says which; only `retrieved` and `computed` check the last step against the evidence).
+- Independence: passages that share an article title are one source (union-find); an UNKNOWN passage is independent of nothing; an answer that depends on no retrieve obligation can never be certified.
 - Model confidence is not used in the stop rule.
 - Risk(s) = (1 - C) + lam_x * X + lam_r * (1 - R), hand-set weights (`--risk-mode scalar --lam-x --lam-r`).
   The default judges a step by the Pareto vector (C, R, D, -X). A search that discovers a conflicting value counts
@@ -65,7 +66,7 @@ python3 -m evidence.diag --trace trace_ctrl.jsonl      # why did a failed questi
 python3 -m unittest discover -s tests -t .
 ```
 
-Controller switches: `--disable Diversify,Verify`, `--learn-p` (use with `--concurrency 1`), `--risk-mode scalar`,
+Controller switches: `--disable Diversify,Verify`, `--no-learn-p` (p per question instead of carried over the run; with `--concurrency > 1` the learned p makes a run not bit-reproducible), `--risk-mode scalar`,
 `--no-det-compare`, `--abstain-uncertified`, weights `--w-gap --w-conflict --w-fragile --w-c-search ...`.
 
 ## What the report shows
@@ -99,6 +100,14 @@ Numbers from different LLMs are not comparable; use one model for all systems of
 
 Not implemented: a confidence / answer-stability stop rule as a contrast baseline (the plan removes model
 confidence from the controller), and the learned classifier for sufficiency that was mentioned as future work.
+
+## Assumptions (what is specific to 2WikiMultiHopQA / English / Wikipedia)
+
+- Provenance unit = article title read from the graph's chunk store (`provenance.py`). On a corpus with another chunk layout every passage is UNKNOWN; the controller prints a warning when more than half of the supporting passages have no title.
+- Type cues (`born on`, `died in`, ...), month names, name aliases and the `TYPE_WORDS` list are English and Wikipedia-style (`state.py`, `derive.py`, `obligations.py`). On another language or dataset they weaken guards silently instead of failing; adapt them there.
+- The deterministic comparison only fires for `A or B` questions about two dates.
+
+The method section for the paper is `paper/evidence_certificate.tex` (compiles standalone).
 
 ## Known limits
 

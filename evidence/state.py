@@ -47,6 +47,10 @@ def date_only(v: str) -> bool:
     return re.sub(r"[\d\W_]+", "", s) == "" and bool(re.search(r"\d", v))
 
 
+_ASKS_TIME = re.compile(r"\b(?:when|what year|which year|in what year|in which year|what date|which date|how old)\b", re.I)
+_ASKS_PLACE = re.compile(r"\b(?:where|which (?:country|city|place|state|town)|what (?:country|city|place|state|town))\b", re.I)
+
+
 def _tokens(s: str) -> set:
     return {w for w in re.findall(r"\w+", s.lower()) if len(w) >= 3}
 
@@ -70,29 +74,44 @@ def subject_in(value: str, titles, passage: str) -> bool:
 
 
 _HONORIFIC = {"sir", "dr", "mr", "lord", "lady", "saint"}
-_SUFFIX = {"jr", "sr", "ii", "iii", "iv", "vi", "vii", "viii", "ix"}
+_ROMAN = re.compile(r"^(?:i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii|xiii|xiv|xv|xvi|xvii|xviii|xix|xx)$")
+_SUFFIX = {"jr", "sr"}
+_PAREN = re.compile(r"\(([^)]*)\)")
+_OF = re.compile(r"^([^,]+?)\s+of\s+([^,]+)$", re.I)
 
 
 def _sig(s: str) -> list:
+    s = _PAREN.sub(" ", s)
     return [w for w in re.findall(r"\w+", s.lower()) if w not in _HONORIFIC and w not in {"the", "of", "and"}]
+
+
+def _suffixes(tokens):
+    return {w for w in tokens if w in _SUFFIX or _ROMAN.match(w)}
 
 
 def same_entity(a: str, b: str) -> bool:
     """Conservative alias test for two surface forms of one name ('Infanta Elena of Spain' ~
-    'Infanta Elena, Duchess of Lugo'): same first two significant words, no digits, same suffixes.
-    Anything with digits (dates, ordinals) must match exactly."""
+    'Infanta Elena, Duchess of Lugo'): same first two significant words, no digits, same regnal
+    numbers / Jr / Sr. A bare surname is an alias of the full name that ends in it. Names that differ
+    in their parenthesised qualifier ('(footballer)' / '(politician)') or in the place after 'of'
+    ('Henry of Wales' / 'Henry of Prussia') are different entities. Anything with digits must match exactly."""
     if norm(a) == norm(b):
         return True
     if re.search(r"\d", a) or re.search(r"\d", b):
         return False
+    pa, pb = [norm(x) for x in _PAREN.findall(a)], [norm(x) for x in _PAREN.findall(b)]
+    if pa and pb and pa != pb:
+        return False
     ta, tb = _sig(a), _sig(b)
-    # a bare surname is the same person as the full name that ends in it ('Annakin' ~ 'Ken Annakin')
     for one, full in ((ta, tb), (tb, ta)):
         if len(one) == 1 and len(one[0]) >= 4 and len(full) >= 2 and full[-1] == one[0]:
             return True
     if len(ta) < 2 or len(tb) < 2 or ta[:2] != tb[:2]:
         return False
-    return {w for w in ta if w in _SUFFIX} == {w for w in tb if w in _SUFFIX}
+    ma, mb = _OF.match(_PAREN.sub(" ", a).strip()), _OF.match(_PAREN.sub(" ", b).strip())
+    if ma and mb and _sig(ma.group(1)) == _sig(mb.group(1)) and _sig(ma.group(2)) != _sig(mb.group(2)):
+        return False
+    return _suffixes(ta) == _suffixes(tb)
 
 
 def is_self_reference(value: str, question: str) -> bool:
@@ -120,6 +139,7 @@ class EvidenceState:
         self.order = [o["id"] for o in obligations["obligations"]]
         self.answer_id = obligations["answer_id"]
         self.question = ""                           # set by the caller; used by the self-reference guard
+        self._uf = {}                                # union-find over article titles (see unit())
         self.items = {}                              # item key -> Item
         self.support = {oid: {} for oid in self.obs}  # oid -> {item key: {var: value}}
         self.context = {}                            # (oid, item key) -> inherited values at match time
@@ -159,11 +179,16 @@ class EvidenceState:
             return "place"
         return None
 
+    def _question_asks_time(self):
+        """'In which year was X born?' makes 'born in ?Y' a date slot: only then a bare year may fill it."""
+        q = self.question or ""
+        return bool(_ASKS_TIME.search(q)) and not _ASKS_PLACE.search(q)
+
     def type_ok(self, oid, var, val):
         t = self.expected_type(oid, var)
         if t == "date" and not re.search(r"\d{3,4}", val):
             return False, f"type mismatch: {var} expects a date, got '{val}'"
-        if t == "place" and date_only(val):
+        if t == "place" and date_only(val) and not self._question_asks_time():
             return False, f"type mismatch: {var} expects a place, got date '{val}'"
         return True, ""
 
@@ -222,7 +247,7 @@ class EvidenceState:
         for c in self._candidates(var, drop).values():
             units = {self.unit(self.items[k]) for k in c["items"]}
             coh = max(self.items[k].coherence for k in c["items"])
-            rows.append(((len(units), coh, len(c["items"])), c["value"], units, c["items"]))
+            rows.append(((len(self.effective_units(units)), coh, len(c["items"])), c["value"], units, c["items"]))
         rows.sort(key=lambda r: r[0], reverse=True)
         return [(v, u, i) for _, v, u, i in rows]
 
@@ -265,11 +290,31 @@ class EvidenceState:
         return self.is_retrieve(oid) and all(self.bound(v) for v in self._vars[oid] if v in self.dep_vars(oid))
 
     # ---- evidence ----------------------------------------------------------
-    @staticmethod
-    def unit(item: Item):
+    def _find(self, t):
+        while self._uf.get(t, t) != t:
+            self._uf[t] = self._uf.get(self._uf[t], self._uf[t])   # path halving
+            t = self._uf[t]
+        return t
+
+    def _union(self, titles):
+        """Titles of one passage belong to one source: passages that share ANY title are not independent."""
+        roots = [self._find(t) for t in titles]
+        for r in roots[1:]:
+            if r != roots[0]:
+                self._uf[r] = roots[0]
+
+    def unit(self, item: Item):
+        """Independence unit of an item: the connected group of article titles it belongs to."""
         if UNIT_MODE == "passage":
             return item.key
-        return "|".join(item.titles) if item.titles else UNKNOWN
+        return self._find(item.titles[0]) if item.titles else UNKNOWN
+
+    @staticmethod
+    def effective_units(units):
+        """Units that count as independent sources. An UNKNOWN passage may be a copy of a known article,
+        so it only counts when nothing with a known title supports the fact."""
+        known = set(units) - {UNKNOWN}
+        return known if known else set(units)
 
     def add_items(self, results, rnd, query):
         """results: [{"text", "coherence"}]. Returns keys of items that are NEW."""
@@ -279,6 +324,7 @@ class EvidenceState:
             if not key or key in self.items:
                 continue
             self.items[key] = Item(key, r["text"], r["coherence"], self.prov.titles(r["text"]), rnd, query)
+            self._union(self.items[key].titles)
             new.append(key)
         return new
 
@@ -316,7 +362,10 @@ class EvidenceState:
     def apply_match(self, oid, item_key, bindings):
         own = self.own_vars(oid)
         self.support[oid][item_key] = {v: bindings[v] for v in own if bindings.get(v)}
-        self.context[(oid, item_key)] = self.dep_context(oid)
+        ctx = self.dep_context(oid)
+        if self.context.get((oid, item_key), ctx) != ctx:
+            self.verified.pop((oid, item_key), None)   # checked against another entity's fact: audit again
+        self.context[(oid, item_key)] = ctx
 
     def remove_support(self, oid, item_key):
         """Drop a support entry that Verify found unsupported by its own passage."""
@@ -363,7 +412,8 @@ class EvidenceState:
         for key, b in self.support[oid].items():
             if self.unit(self.items[key]) in drop or self.context.get((oid, key), {}) != ctx:
                 continue
-            if any(chosen[v] is None or norm(b.get(v, "")) != norm(chosen[v]) for v in own):
+            if any(chosen[v] is None or not (norm(b.get(v, "")) == norm(chosen[v])
+                                             or same_entity(b.get(v, ""), chosen[v])) for v in own):
                 continue
             out.append(key)
         return sorted(out, key=lambda k: -self.items[k].coherence)
@@ -376,8 +426,9 @@ class EvidenceState:
         return sum(self.covered(o) for o in r) / len(r) if r else 1.0
 
     def kappa(self, oid):
-        """Distinct provenance units behind the chosen value of an obligation (UNKNOWN counts once)."""
-        return len({self.unit(self.items[k]) for k in self.live_support(oid)})
+        """Independent provenance units behind the chosen value of an obligation. UNKNOWN counts (once) only
+        when no passage with a known article supports the fact."""
+        return len(self.effective_units({self.unit(self.items[k]) for k in self.live_support(oid)}))
 
     def kappa_known(self, oid):
         """Like kappa, but only units with a known article title (UNKNOWN is never independent)."""

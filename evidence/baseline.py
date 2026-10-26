@@ -43,15 +43,22 @@ SHORT = "\nKeep the text inside <answer> as short as possible (an entity, date, 
 
 
 async def gen(client, args, msgs, stop):
-    r = await client.chat.completions.create(
-        model=args.model, messages=msgs, temperature=0, max_tokens=1024, stop=stop,
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}})
-    return r.choices[0].message.content or ""
+    """One chat call, retried with a growing pause: a short outage must not end the question with no answer."""
+    for attempt in range(3):
+        try:
+            r = await client.chat.completions.create(
+                model=args.model, messages=msgs, temperature=0, max_tokens=1024, stop=stop,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+            return r.choices[0].message.content or ""
+        except Exception:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(3 * (attempt + 1))
 
 
 async def run_one(client, args, rec):
     msgs = [{"role": "user", "content": INSTR + "Question: " + rec["question"] + (SHORT if args.short else "")}]
-    searches, turns, answer, err, trail, seen = 0, 0, "", None, [], []
+    searches, turns, answer, err, trail, seen, search_errors = 0, 0, "", None, [], [], 0
     try:
         for _ in range(args.max_turns):
             turns += 1
@@ -69,6 +76,7 @@ async def run_one(client, args, rec):
                 info = "\n".join(x["text"] for x in parse_results(res))
             except Exception as e:
                 info = f"[search error: {e}]"
+                search_errors += 1
             searches += 1
             seen.append(info)
             msgs += [{"role": "assistant", "content": out + "</query>"},
@@ -87,7 +95,7 @@ async def run_one(client, args, rec):
     # heuristic: the answer string occurs in what was retrieved (yes/no answers cannot be checked this way)
     grounded = bool(a) and a in norm(" ".join(seen))
     return {"question": rec["question"], "gold": gold, "answer": answer, "em": em, "f1": f1, "grounded": grounded,
-            "searches": searches, "turns": turns, "error": err, "trail": trail}
+            "searches": searches, "turns": turns, "error": err, "search_errors": search_errors, "trail": trail}
 
 
 async def main():
@@ -134,6 +142,9 @@ async def main():
     print(f"answer string found in retrieved text: {len(g)}/{n} EM={sum(r['em'] for r in g)/max(len(g),1):.3f} | "
           f"not found (yes/no, derived or from the model's own memory): {len(u)} EM={sum(r['em'] for r in u)/max(len(u),1):.3f}")
     print(f"no answer: {sum(1 for r in rs if not r['answer'])} | errors: {sum(1 for r in rs if r['error'])}")
+    failed = sum(1 for r in rs if r["error"]) + sum(r.get("search_errors", 0) for r in rs)
+    if failed:   # same marker as the controller: the pipeline discards a run with failed calls
+        print(f"!! {failed} LLM/search call(s) failed - these results are NOT valid")
 
 
 if __name__ == "__main__":
