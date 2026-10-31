@@ -28,7 +28,7 @@ question
 
 ## Full rerun from scratch
 
-1. Build the hypergraph and start the retrieval API exactly as in `README.md` (`script_process.py`, `script_build.py`,
+1. Build the hypergraph and start the retrieval API exactly as in `README_GRAPH_R1.md` (`script_process.py`, `script_build.py`,
    `script_api.py`). The LLM used for graph construction is read from `GRAPHR1_LLM_BASE_URL`
    (default `http://localhost:8000/v1`).
 2. Evidence image (adds `openai<3`, `networkx`, `matplotlib` to the Graph-R1 image):

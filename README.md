@@ -1,152 +1,109 @@
-# Graph-R1: When GraphRAG Meets RL
+# Evidence-Certificate GraphRAG on top of Graph-R1
 
-Official resources of **"Graph-R1: Towards Agentic GraphRAG Framework via End-to-end Reinforcement Learning"**. Haoran Luo, Haihong E, Guanting Chen, Qika Lin, Yikai Guo, Fangzhi Xu, Zemin Kuang, Meina Song, Xiaobao Wu, Yifan Zhu, Luu Anh Tuan. **ICML 2026** \[[paper](https://arxiv.org/abs/2507.21892)\].
+A **training-free** layer on top of [Graph-R1](https://arxiv.org/abs/2507.21892) (agentic GraphRAG over a knowledge
+hypergraph). Graph-R1 trains an LLM with reinforcement learning to decide what to retrieve. This project keeps the
+LLM **frozen** and the retrieval **untouched**, and instead adds a decision-time controller that audits the evidence
+and attaches an **Evidence Certificate** to every answer.
 
-## Overview
+> Status: research prototype. Evaluated so far on 100 held-out 2WikiMultiHopQA questions with a small development
+> LLM. See [Results](#results-so-far) for what is and is not shown.
 
-<div align="center">
-  <img src="figs/F1.png" width="80%"/>
-</div>
+## The idea in one paragraph
 
-Recently, the **GraphRAG** method effectively addresses the data silos issue, significantly enhancing knowledge retrieval efficiency. Nevertheless, the disconnect between graph-structured knowledge and language modalities continues to constrain performance. 
+Multi-hop questions fail silently: the model answers confidently from a wrong or single-source passage. Here, the
+question is first turned into **evidence obligations** (the facts that must be found, with `?variables` linking
+hops). Each retrieved passage is checked by **guards** (quote really in the passage, value really in the passage,
+right type such as date vs place, right entity, no self-reference). The accepted evidence forms an **Evidence Support
+Graph**; an **audit** measures coverage, robustness (independent sources, critical cuts, counterfactual fragility),
+conflicts and provenance independence. A **controller** picks the next action (`FillGap`, `Bridge`, `Diversify`,
+`Challenge`, `Verify`, `Answer`) by `VNE = p * gain - cost`, and stops when the audit passes. The final answer carries
+a **certificate**: issued only if every required obligation is covered, the graph is connected, no conflict is
+unresolved, critical facts were verified, **and** the answer itself is grounded in that evidence. Model confidence is
+never used.
 
-To bridge this gap, we propose **Graph-R1**, an **end-to-end reinforcement learning (RL)** framework designed to improve **reasoning-on-graph capabilities** of large language models (LLMs). 
+```
+question
+  -> obligations   evidence/obligations.py   what must be found (retrieve / derive steps)
+  -> state         evidence/state.py         accepted evidence + guards
+  -> audit         evidence/audit.py         coverage, robustness, conflicts, provenance, cuts, certificate
+  -> controller    evidence/controller.py    FillGap / Bridge / Diversify / Challenge / Verify / Answer
+  -> answer + certificate   (evidence/derive.py computes date comparisons from certified dates)
+```
 
-<div align="center">
-  <img src="figs/F2.png" width="90%"/>
-</div>
+Full design, plan conformance table, assumptions and known limits: **[EVIDENCE.md](EVIDENCE.md)**.
+Method section for the paper (LaTeX): **[paper/evidence_certificate.tex](paper/evidence_certificate.tex)**.
 
-Specifically, we constructs a **knowledge hypergraph** using **n-ary relation extraction**. We then employ an explicit reward mechanism within RL, enabling the LLM to iteratively execute a "**think–generate query–retrieve subgraph–rethink**" reasoning cycle. This iterative approach enables the model to effectively leverage graph knowledge to produce high-quality answers. 
+## Results so far
 
-By integrating structured knowledge into LLM reasoning more flexibly via reinforcement learning, Graph-R1 holds promise for aplications in **knowledge-intensive fields** such as healthcare, finance, and law.
+100 held-out 2WikiMultiHopQA questions, one frozen development LLM for all systems, same retrieval API.
 
-## Experimental Results
-**Results on Different RL Algorithms:**
-<table>
-  <tr>
-    <td><img src="./figs/1_f1.png" width="100%"/></td>
-    <td><img src="./figs/1_em.png" width="100%"/></td>
-    <td><img src="./figs/1_res.png" width="100%"/></td>
-    <td><img src="./figs/1_turn.png" width="100%"/></td>
-  </tr>
-</table>
+| system | EM (95% CI) | F1 | searches / question |
+|---|---|---|---|
+| Graph-R1 agent loop, frozen LLM (baseline) | 0.700 [0.604, 0.781] | 0.768 | 3.72 |
+| Evidence controller (ours) | 0.630 [0.532, 0.718] | 0.663 | 5.82 |
 
-**Results on Different GraphRAG Datasets:**
-<table>
-  <tr>
-    <td><img src="./figs/2_f1.png" width="100%"/></td>
-    <td><img src="./figs/2_em.png" width="100%"/></td>
-    <td><img src="./figs/2_res.png" width="100%"/></td>
-    <td><img src="./figs/2_turn.png" width="100%"/></td>
-  </tr>
-</table>
+Paired difference is not significant (baseline 12 wins, controller 5, McNemar p = 0.143).
 
-**Results on Different Parameter Scale of LLM:**
-<table>
-  <tr>
-    <td><img src="./figs/3_f1.png" width="100%"/></td>
-    <td><img src="./figs/3_em.png" width="100%"/></td>
-    <td><img src="./figs/3_res.png" width="100%"/></td>
-    <td><img src="./figs/3_turn.png" width="100%"/></td>
-  </tr>
-</table>
+| certificate | share | EM |
+|---|---|---|
+| certified answers | 67 / 100 | 0.851 |
+| uncertified answers | 33 / 100 | 0.182 |
+| selective EM (answer only if certified, count the rest wrong) | | 0.570 |
 
-## Graph-R1 Implementation
+How to read this honestly:
 
-### Install Environment
+- **Raw accuracy did not improve**; it is lower, though not significantly.
+- **The certificate separates answers well**: 85% correct when issued, 18% when not. This is the contribution being
+  tested: knowing *which* answers to trust.
+- The baseline has a simple signal of its own (answer found in retrieved text): EM 0.780 on 82 questions. The
+  certificate is slightly more precise (0.851) at lower coverage; this difference is not tested as significant.
+- 10 of the 67 certified answers are wrong (mostly place / country / date of death); not yet diagnosed.
+- Not done yet: other benchmarks (HotpotQA, MuSiQue), a larger final LLM, comparison with the RL-trained Graph-R1.
+- Ablations (13 systems) are in the generated `report.md`; Verify is the only component that clearly matters here.
+
+## Quick start
+
+Requires a running Graph-R1 retrieval API (`script_api.py`, see [README_GRAPH_R1.md](README_GRAPH_R1.md)) and an
+OpenAI-compatible server for the frozen LLM.
+
 ```bash
-conda create -n graphr1 python==3.11.11
-conda activate graphr1
-pip3 install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu124
-pip3 install flash-attn --no-build-isolation
-pip3 install -e .
-pip3 install -r requirements.txt
-# pip install debugpy==1.8.0
-# pip install "ray[default]" debugpy
+docker build -f Dockerfile.evidence -t graphr1:evidence-v1 .
+
+export EVIDENCE_LLM_BASE_URL=http://<llm-host>/v1
+export EVIDENCE_LLM_MODEL=<model>
+export EVIDENCE_SEARCH_URL=http://<api-host>:8001/search
+export EVIDENCE_DATA_DIR=expr/2WikiMultiHopQA
+
+# everything in one command: obligations, controller, baseline, statistics, graphs, ablations
+python3 -m evidence.pipeline --dataset datasets/2WikiMultiHopQA/raw/qa_test.json --n 100 \
+    --out-dir runs/main --ablations
 ```
 
-### Dataset Preparation
-> We conduct experiments on six datasets: 2WikiMultiHopQA, HotpotQA, Musique, NQ, PopQA, and TriviaQA. You can download them from [TeraBox](https://1024terabox.com/s/12FXnOnOhOZNyGzjWuoo-qg), and set the data path in `datasets/`.
+Outputs in `runs/main/`: `report.md` (EM/F1, certificate tables, paired tests, ablations), `trace_<system>.jsonl`,
+`graphs/` (support graph of each question).
 
-### Quick Start: Graph-R1 on 2WikiMultiHopQA
-#### 1. Preprocess 2WikiMultiHopQA dataset to parquet format
-```bash
-python script_process.py --data_source 2WikiMultiHopQA
-# python script_process.py --data_source HotpotQA
-# python script_process.py --data_source Musique
-# python script_process.py --data_source NQ
-# python script_process.py --data_source PopQA
-# python script_process.py --data_source TriviaQA
-```
+Tests (no GPU, no network): `python3 -m unittest discover -s tests -t .`
 
-#### 2. Extract contexts and build Knowledge HyperGraph (Optional)
-> We use GPT-4o-mini as extractor, so you should set your openai API key in `openai_api_key_txt`.
-```bash
-nohup python -u script_build.py --data_source 2WikiMultiHopQA > result_build_2WikiMultiHopQA.log 2>&1 &
-# nohup python -u script_build.py --data_source HotpotQA > result_build_HotpotQA.log 2>&1 &
-# nohup python -u script_build.py --data_source Musique > result_build_Musique.log 2>&1 &
-# nohup python -u script_build.py --data_source NQ > result_build_NQ.log 2>&1 &
-# nohup python -u script_build.py --data_source PopQA > result_build_PopQA.log 2>&1 &
-# nohup python -u script_build.py --data_source TriviaQA > result_build_TriviaQA.log 2>&1 &
-```
-> You can also skip this step, download the pre-built Knowledge HyperGraph from [TeraBox](https://1024terabox.com/s/1y1G7trP-hcmIDQRUaBaDDw), and set in `expr/`.
+## Repository map
 
-#### 3. Set up retrieve server at 8001 port
-```bash
-nohup python -u script_api.py --data_source 2WikiMultiHopQA > result_api_2WikiMultiHopQA.log 2>&1 &
-# nohup python -u script_api.py --data_source HotpotQA > result_api_HotpotQA.log 2>&1 &
-# nohup python -u script_api.py --data_source Musique > result_api_Musique.log 2>&1 &
-# nohup python -u script_api.py --data_source NQ > result_api_NQ.log 2>&1 &
-# nohup python -u script_api.py --data_source PopQA > result_api_PopQA.log 2>&1 &
-# nohup python -u script_api.py --data_source TriviaQA > result_api_TriviaQA.log 2>&1 &
-```
+| path | what |
+|---|---|
+| `evidence/` | **this project**: obligations, state and guards, audit and certificate, controller, baseline, statistics, pipeline |
+| `tests/` | offline tests for the evidence layer |
+| `EVIDENCE.md` | architecture, flags, plan conformance, assumptions, known limits |
+| `paper/` | LaTeX method section |
+| `Dockerfile.evidence` | Graph-R1 image plus the few extra dependencies |
+| `graphr1/`, `agent/`, `verl/`, `script_*.py`, `run_*.sh`, `evaluation/`, `inference/` | original Graph-R1 code, unchanged |
+| `README_GRAPH_R1.md` | original Graph-R1 README (graph building, retrieval server, RL training) |
 
-#### 4. Run GRPO/REINFORCE++/PPO training with Qwen2.5-3B-Instruct (Need 4 x 48GB GPUs)
-```bash
-# GRPO
-nohup bash -u run_grpo.sh -p Qwen/Qwen2.5-3B-Instruct -m Qwen2.5-3B-Instruct -d 2WikiMultiHopQA > result_run_Qwen2.5-3B-Instruct_2WikiMultiHopQA_grpo.log 2>&1 &
-# nohup bash -u run_grpo.sh -p Qwen/Qwen2.5-3B-Instruct -m Qwen2.5-3B-Instruct -d HotpotQA > result_run_Qwen2.5-3B-Instruct_HotpotQA_grpo.log 2>&1 &
-# nohup bash -u run_grpo.sh -p Qwen/Qwen2.5-3B-Instruct -m Qwen2.5-3B-Instruct -d Musique > result_run_Qwen2.5-3B-Instruct_Musique_grpo.log 2>&1 &
-# nohup bash -u run_grpo.sh -p Qwen/Qwen2.5-3B-Instruct -m Qwen2.5-3B-Instruct -d NQ > result_run_Qwen2.5-3B-Instruct_NQ_grpo.log 2>&1 &
-# nohup bash -u run_grpo.sh -p Qwen/Qwen2.5-3B-Instruct -m Qwen2.5-3B-Instruct -d PopQA > result_run_Qwen2.5-3B-Instruct_PopQA_grpo.log 2>&1 &
-# nohup bash -u run_grpo.sh -p Qwen/Qwen2.5-3B-Instruct -m Qwen2.5-3B-Instruct -d TriviaQA > result_run_Qwen2.5-3B-Instruct_TriviaQA_grpo.log 2>&1 &
-# REINFORCE++
-# nohup bash -u run_rpp.sh -p Qwen/Qwen2.5-3B-Instruct -m Qwen2.5-3B-Instruct -d 2WikiMultiHopQA > result_run_Qwen2.5-3B-Instruct_2WikiMultiHopQA_rpp.log 2>&1 &
-# PPO
-# nohup bash -u run_ppo.sh -p Qwen/Qwen2.5-3B-Instruct -m Qwen2.5-3B-Instruct -d 2WikiMultiHopQA > result_run_Qwen2.5-3B-Instruct_2WikiMultiHopQA_ppo.log 2>&1 &
-```
+## Limits to know before reusing
 
-#### 5. Close retrieve server 8001 port
-```bash
-fuser -k 8001/tcp
-```
+- Provenance, type cues and name aliases assume English Wikipedia-style text (2WikiMultiHopQA). On another corpus
+  they weaken silently; adapt `evidence/provenance.py`, `state.py`, `derive.py`.
+- Independent second sources are rare in 2WikiMultiHopQA, so Diversify, Bridge and Challenge show no benefit there.
+- The certificate covers retrieved facts; it cannot detect a passage about a different entity with the same name.
 
-### Evaluation
-> For evaluation, please refer to the [evaluation](./evaluation/README.md) folder.
+## Credits
 
-
-### Inference
-> For inference, please refer to the [inference](./inference/README.md) folder.
-
-
-## BibTex
-
-If you find this work is helpful for your research, please cite:
-
-```bibtex
-@misc{luo2025graphr1,
-      title={Graph-R1: Towards Agentic GraphRAG Framework via End-to-end Reinforcement Learning}, 
-      author={Haoran Luo and Haihong E and Guanting Chen and Qika Lin and Yikai Guo and Fangzhi Xu and Zemin Kuang and Meina Song and Xiaobao Wu and Yifan Zhu and Luu Anh Tuan},
-      year={2025},
-      eprint={2507.21892},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2507.21892}, 
-}
-```
-
-For further questions, please contact: haoran.luo@ieee.org.
-
-## Acknowledgement
-
-This repo benefits from [Agent-R1](https://github.com/0russwest0/Agent-R1), [HyperGraphRAG](https://github.com/LHRLAB/HyperGraphRAG), [FlashRAG](https://github.com/RUC-NLPIR/FlashRAG), [LightRAG](https://github.com/HKUDS/LightRAG), [HippoRAG2](https://github.com/OSU-NLP-Group/HippoRAG), [R1-Searcher](https://github.com/RUCAIBox/R1-Searcher) and [Search-R1](https://github.com/RUCAIBox/R1-Searcher). Thanks for their wonderful works.
+Built on Graph-R1 (Luo et al., ICML 2026): <https://arxiv.org/abs/2507.21892>. Original citation and acknowledgements
+are kept in [README_GRAPH_R1.md](README_GRAPH_R1.md). License: see `LICENSE`.
