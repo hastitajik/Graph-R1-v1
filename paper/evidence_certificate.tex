@@ -151,8 +151,7 @@ unless the question or the chain disambiguates it, and the final comparison is c
 of next evidence is an estimate with hand-set gains, not an exact expected risk reduction.
 
 \subsection{Experimental protocol}
-\textbf{Systems} (same frozen LLM, same retrieval API, same questions): the Graph-R1 agent loop without RL (baseline), the controller, and ablations: without Diversify, Verify, Bridge, Challenge;
-FillGap only; without the fragility term; guards off; every passage independent (naive provenance); scalar risk; LLM comparison; per-question $p$.
+\textbf{Systems} (same frozen LLM, same retrieval API, same questions): the Graph-R1 agent loop without RL (baseline), and the controller.
 \textbf{Metrics}: EM, F1, retrieval queries and LLM calls per question; the share of certified answers; EM on certified and uncertified answers; selective EM
 (answer only when certified, abstention counts as wrong). \textbf{Statistics}: Wilson 95\% intervals; paired wins/losses against a reference, exact McNemar and a bootstrap interval of the EM difference
 (\texttt{evidence/compare.py}). \textbf{Data}: a development set on which the guards were tuned and a disjoint held-out set (\texttt{--exclude}).

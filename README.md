@@ -59,7 +59,6 @@ How to read this honestly:
   certificate is slightly more precise (0.851) at lower coverage; this difference is not tested as significant.
 - 10 of the 67 certified answers are wrong (mostly place / country / date of death); not yet diagnosed.
 - Not done yet: other benchmarks (HotpotQA, MuSiQue), a larger final LLM, comparison with the RL-trained Graph-R1.
-- Ablations (13 systems) are in the generated `report.md`; Verify is the only component that clearly matters here.
 
 ## Quick start
 
@@ -74,12 +73,12 @@ export EVIDENCE_LLM_MODEL=<model>
 export EVIDENCE_SEARCH_URL=http://<api-host>:8001/search
 export EVIDENCE_DATA_DIR=expr/2WikiMultiHopQA
 
-# everything in one command: obligations, controller, baseline, statistics, graphs, ablations
+# everything in one command: obligations, controller, baseline, statistics, graphs
 python3 -m evidence.pipeline --dataset datasets/2WikiMultiHopQA/raw/qa_test.json --n 100 \
-    --out-dir runs/main --ablations
+    --out-dir runs/main
 ```
 
-Outputs in `runs/main/`: `report.md` (EM/F1, certificate tables, paired tests, ablations), `trace_<system>.jsonl`,
+Outputs in `runs/main/`: `report.md` (EM/F1, certificate tables, paired tests), `trace_<system>.jsonl`,
 `graphs/` (support graph of each question).
 
 Tests (no GPU, no network): `python3 -m unittest discover -s tests -t .`

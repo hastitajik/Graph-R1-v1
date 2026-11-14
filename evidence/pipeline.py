@@ -7,11 +7,9 @@ Steps (each is skipped when its output already exists, unless --force):
   1. provenance index   (python3 -m evidence.provenance build)
   2. obligations        (python3 -m evidence.obligations)            -> <out-dir>/obligations.jsonl
   3. controller         (python3 -m evidence.controller)             -> <out-dir>/trace_controller.jsonl
-  4. ablations          (--ablations: no Diversify / Verify / Bridge / Challenge, only FillGap, no fragility term, per-question p,
-                        guards off, naive provenance, scalar risk, LLM comparison)
-  5. baseline           (python3 -m evidence.baseline --short)       -> <out-dir>/trace_baseline.jsonl
-  6. report             (python3 -m evidence.compare)                -> <out-dir>/report.md
-  7. support graphs     (python3 -m evidence.export_graph)           -> <out-dir>/graphs/
+  4. baseline           (python3 -m evidence.baseline --short)       -> <out-dir>/trace_baseline.jsonl
+  5. report             (python3 -m evidence.compare)                -> <out-dir>/report.md
+  6. support graphs     (python3 -m evidence.export_graph)           -> <out-dir>/graphs/
 
 The same frozen LLM and the same /search API are used for every system, so the numbers are comparable.
 """
@@ -85,7 +83,6 @@ def main():
     ap.add_argument("--search-url", default=SEARCH_URL)
     ap.add_argument("--api-base", default=LLM_BASE_URL)
     ap.add_argument("--model", default=LLM_MODEL)
-    ap.add_argument("--ablations", action="store_true")
     ap.add_argument("--skip-baseline", action="store_true")
     ap.add_argument("--concurrency", type=int, default=3)
     ap.add_argument("--force", action="store_true", help="recompute steps whose output exists")
@@ -119,14 +116,6 @@ def main():
 
     runs = {}
     systems = {"controller": []}
-    if args.ablations:
-        systems.update({"no_diversify": ["--disable", "Diversify"], "no_verify": ["--disable", "Verify"],
-                        "no_bridge": ["--disable", "Bridge"], "no_challenge": ["--disable", "Challenge"],
-                        "naive_provenance": ["--unit", "passage"],
-                        "scalar_risk": ["--risk-mode", "scalar"], "llm_compare": ["--no-det-compare"],
-                        "fillgap_only": ["--disable", "Diversify,Bridge,Challenge,Verify"],
-                        "no_fragility": ["--w-fragile", "0"], "no_learn_p": ["--no-learn-p"],
-                        "no_guards": ["--env", "EVIDENCE_SELF_CHECK=0", "--env", "EVIDENCE_SUBJECT_CHECK=0"]})
     for name, extra in systems.items():
         trace = f"{out}/trace_{name}.jsonl"
         env = {}                                   # "--env K=V" pairs are environment switches, not controller flags

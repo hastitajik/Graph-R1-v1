@@ -45,7 +45,7 @@ question
    ```
    python3 -m evidence.pipeline --dataset datasets/2WikiMultiHopQA/raw/qa_test.json --n 100 \
        --search-url http://<api-host>:8001/search --api-base http://<llm-host>/v1 --model <name> \
-       --out-dir runs/main --ablations
+       --out-dir runs/main
    ```
    Add `--exclude obligations_dev30.jsonl obligations_bonsai30.jsonl` to sample a held-out set that does not
    overlap the questions the guards were tuned on.
@@ -93,7 +93,6 @@ Numbers from different LLMs are not comparable; use one model for all systems of
 | Answer only with a certificate | the default answers anyway and flags the answer as uncertified, so that EM can be reported both ways; `--abstain-uncertified` refuses to answer, and `report.md` shows the selective EM | `solve`, `compare.py` |
 | frozen retrieval (entity + hyperedge dual path, rank fusion) | untouched, used through `/search` | Graph-R1 |
 | comparison with the Graph-R1 agent loop | done, same LLM and API | `baseline.py` |
-| ablations | no Diversify / Verify / Bridge / Challenge, FillGap only, no fragility term, guards off, naive provenance (every passage independent), scalar risk, LLM comparison | `pipeline.py --ablations` |
 | informed query (repair of a missed first hop) | when the plain queries of an obligation are used up: one blind paraphrase, then up to two LLM queries that read titles and openings of the passages retrieved so far | `controller.informed_queries`, `Episode.fillgap_mode` |
 | entity type in matching | the matcher sees the question and skips same-named entities of another kind; obligations must keep the type word (film, album, village ...) | `run_mvp.MAP_SYSTEM`, `obligations.validate` |
 | statistics | Wilson CI of EM, paired wins / losses, exact McNemar, bootstrap CI of the difference, selective prediction by certified / coverage / grounded | `compare.py` |
